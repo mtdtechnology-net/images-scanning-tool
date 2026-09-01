@@ -1,4 +1,4 @@
-# Financial Report AI - Backend
+# Images extractor AI - Backend
 
 This is the backend service for the Financial Report AI application. It uses **FastAPI**, **LangGraph**, **PaddleOCR**, and **Ollama** (LLM) to process financial documents (PDFs, images) and extract structured data using AI.
 
