@@ -169,10 +169,12 @@ async def generate_financial_report(
     try:
         result = graph.invoke({
             "documents": all_document_images,
+            "source": "mobile",
             "extracted_texts": [],
             "extracted_expenses": [],
             "current_doc_index": 0,
             "report": "",
+            "web_result": {},
             "company_name": "Nexus Digital",
             "company_cif": "RO38492011",
         })
@@ -216,4 +218,89 @@ async def generate_financial_report(
         "files": filenames,
         "extracted_texts": result.get("extracted_texts", []),
         "expenses": expenses_obj,
+    }
+
+
+@app.post("/api/web-report")
+async def generate_web_report(
+    files: List[UploadFile] = File(...)
+):
+    """Process multiple documents and return categorized expenses for web form auto-fill."""
+
+    print("[API-WEB] Apel web-report")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
+
+    all_document_images: list[str] = []
+    filenames: list[str] = []
+
+    for file in files:
+        if file.content_type not in SUPPORTED_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {file.content_type} ({file.filename}). Supported: PDF, PNG, JPG, WEBP"
+            )
+
+        file_bytes = await file.read()
+
+        if len(file_bytes) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File '{file.filename}' too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)} MB"
+            )
+
+        try:
+            images = parse_document_to_images(file_bytes, file.content_type)
+            all_document_images.extend(images)
+            filenames.append(file.filename)
+        except Exception as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Failed to process '{file.filename}': {str(e)}"
+            )
+
+    if not all_document_images:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not extract any images from the uploaded documents."
+        )
+
+    print(f"[API-WEB] Processing {len(files)} file(s), {len(all_document_images)} page(s) total")
+
+    try:
+        result = graph.invoke({
+            "documents": all_document_images,
+            "source": "web",
+            "extracted_texts": [],
+            "extracted_expenses": [],
+            "current_doc_index": 0,
+            "report": "",
+            "web_result": {},
+            "company_name": "Nexus Digital",
+            "company_cif": "RO38492011",
+        })
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Web report generation failed: {str(e)}"
+        )
+
+    web_result = result.get("web_result", {})
+    items = web_result.get("items", [])
+
+    if not items:
+        return {
+            "success": False,
+            "error": "The AI could not extract any expenses from the uploaded documents.",
+            "pages_processed": len(all_document_images),
+            "files": filenames,
+        }
+
+    return {
+        "success": True,
+        "pages_processed": len(all_document_images),
+        "files": filenames,
+        **web_result,
     }

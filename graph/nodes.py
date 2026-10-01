@@ -11,7 +11,7 @@ llm_lock = threading.Lock()
 # llm = ChatOllama(model="llama3.1:8b", temperature=0)
 
 llm = ChatOllama(
-    model="qwen2.5:1.5b", #
+    model="llama3.1:8b", #
     base_url="http://localhost:11434",
     temperature=0
 )
@@ -126,3 +126,132 @@ def generate_report(state: FinancialState) -> dict:
     """Format expenses into report dict."""
     report = "### Business Trip Expenses Extracted Successfully."
     return {"report": report}
+
+
+def _deduce_means_of_transport(description: str) -> str:
+    """Deduce meansOfTransport from expense description.
+
+    Returns one of the EXACT values accepted by the frontend dropdown:
+    "Plane", "Train", "Car", "Bus", "Company car", "Other".
+    """
+    desc = description.lower()
+
+    plane_keywords = ["flight", "plane", "air", "wizz", "ryanair", "tarom",
+                      "lufthansa", "blue air", "aeroport", "airport", "zbor"]
+    train_keywords = ["train", "tren", "cfr", "railway"]
+    bus_keywords = ["bus", "coach", "autobuz", "flixbus", "flix"]
+    car_keywords = ["fuel", "motorina", "benzina", "diesel", "omv", "petrom",
+                    "rompetrol", "mol", "lukoil", "socar", "gas station",
+                    "parking", "parcare", "taxi", "uber", "bolt", "toll",
+                    "rovinieta", "vigneta"]
+
+    for kw in plane_keywords:
+        if kw in desc:
+            return "Plane"
+    for kw in train_keywords:
+        if kw in desc:
+            return "Train"
+    for kw in bus_keywords:
+        if kw in desc:
+            return "Bus"
+    for kw in car_keywords:
+        if kw in desc:
+            return "Car"
+
+    return "Other"
+
+
+def aggregate_web_expenses(state: FinancialState) -> dict:
+    """Aggregate all extracted expenses into web form structure.
+
+    Categorizes each expense into transport/accommodation/other,
+    sums up the totals per category, deduces the trip location from
+    vendor addresses, and builds the accommodation and transport tables.
+    """
+    from collections import Counter
+
+    expenses = state.get("extracted_expenses", [])
+
+    transport_total = 0.0
+    accommodation_total = 0.0
+    other_total = 0.0
+    currency = "RON"
+    items = []
+    cities = []
+    countries = []
+    accommodation_list = []
+    transport_list = []
+
+    for exp in expenses:
+        if exp == "__INVALID_DOCUMENT__":
+            continue
+
+        currency = exp.currency
+        amount = exp.expense_amount
+        category = getattr(exp, "expense_category", "other")
+
+        if category == "transport":
+            transport_total += amount
+        elif category == "accommodation":
+            accommodation_total += amount
+        else:
+            other_total += amount
+
+        # Collect location data from all receipts
+        vendor_city = getattr(exp, "vendor_city", "")
+        vendor_country = getattr(exp, "vendor_country", "")
+        if vendor_city:
+            cities.append(vendor_city)
+        if vendor_country:
+            countries.append(vendor_country)
+
+        # Build accommodation entries from hotel invoices
+        if category == "accommodation":
+            accommodation_list.append({
+                "accommodationName": exp.expense_description,
+                "numberOfNights": getattr(exp, "number_of_nights", 1) or 1,
+            })
+
+        # Build transport entries from transport receipts
+        if category == "transport":
+            transport_list.append({
+                "city": vendor_city,
+                "meansOfTransport": _deduce_means_of_transport(exp.expense_description),
+            })
+
+        items.append({
+            "expense_description": exp.expense_description,
+            "invoice_number_date": exp.invoice_number_date,
+            "receipt_date": exp.receipt_date,
+            "expense_amount": exp.expense_amount,
+            "currency": exp.currency,
+            "expense_category": category,
+            "vendor_city": vendor_city,
+            "vendor_country": vendor_country,
+        })
+
+    # Deduce the most likely trip location from all vendor addresses
+    location = Counter(cities).most_common(1)[0][0] if cities else ""
+    country = Counter(countries).most_common(1)[0][0] if countries else ""
+
+    # Estimate per diem (50 RON per day)
+    # Trip days is usually total nights + 1. If no nights, assume a 1-day trip.
+    total_nights = sum(acc.get("numberOfNights", 1) for acc in accommodation_list)
+    trip_days = total_nights + 1 if total_nights > 0 else 1
+    per_diem_cost = trip_days * 50.0
+
+    return {
+        "web_result": {
+            "transportCost": round(transport_total, 2),
+            "accommodationCost": round(accommodation_total, 2),
+            "otherCosts": round(other_total, 2),
+            "perDiemCost": round(per_diem_cost, 2),
+            "currency": currency,
+            "estimatedTotalCost": round(transport_total + accommodation_total + other_total + per_diem_cost, 2),
+            "location": location,
+            "country": country,
+            "accommodation": accommodation_list,
+            "transport": transport_list,
+            "items": items,
+        }
+    }

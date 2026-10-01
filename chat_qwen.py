@@ -2,7 +2,7 @@ from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage
 
 # Inițializăm modelul. Poți schimba 'temperature' (0 = strict, 1 = mai creativ)
-llm = ChatOllama(model="qwen2.5:7b", temperature=0.7)
+llm = ChatOllama(model="llama3.1:8b", temperature=0)
 chat_history = []
 
 print("=== Qwen2.5:7b Chat ===")
