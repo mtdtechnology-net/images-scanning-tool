@@ -61,8 +61,8 @@ def _process_single_image(args: tuple) -> tuple[int, str]:
     
     # PaddleOCR nu este complet thread-safe, așa că blocăm execuția pe durata inferenței
     with _ocr_lock:
-        # Folosim noul API predict() din PaddleOCR 3.x
-        result = ocr_instance.predict(img_array)
+        # Chiar și în 3.x, metoda principală a rămas .ocr() pentru obiectul de bază
+        result = ocr_instance.ocr(img_array)
     
     print(f"[DEBUG-OCR] Raw result length: {len(result) if result else 'None'}")
     if result and result[0]:
