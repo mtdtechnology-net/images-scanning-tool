@@ -36,6 +36,16 @@ def _get_ocr():
                 _ocr = PaddleOCR(lang="en", use_angle_cls=False)
     return _ocr
 
+def _merge_continuation_lines(lines_text: list[str]) -> list[str]:
+    """Merge OCR rows that don't start with a date into the previous row."""
+    merged: list[str] = []
+    for line in lines_text:
+        if _DATE_LINE_RE.match(line) or not merged:
+            merged.append(line)
+        else:
+            merged[-1] = f"{merged[-1]}\n{line}"
+    return merged
+
 def _process_single_image(args: tuple) -> tuple[int, str]:
     img_b64, doc_index, total_docs = args
 
