@@ -90,20 +90,22 @@ async def health_check():
 
 
 @app.get("/api/secure-health")
-async def secure_health_check(user_payload: dict = Depends(verify_token)):
+# async def secure_health_check(user_payload: dict = Depends(verify_token)):
+async def secure_health_check():
     """
     Endpoint simplu pentru a testa rapid autentificarea Keycloak.
     """
     return {
         "status": "success",
-        "message": "Autentificarea a funcționat perfect!",
-        "client_conectat": user_payload.get("azp", "Necunoscut")
+        "message": "Autentificarea a funcționat perfect! (Validare dezactivata)",
+        "client_conectat": "FaraAuth" # user_payload.get("azp", "Necunoscut")
     }
 
 
 
 @app.get("/api/graph")
-async def get_graph_image(user_payload: dict = Depends(verify_token)):
+# async def get_graph_image(user_payload: dict = Depends(verify_token)):
+async def get_graph_image():
     """Returns the LangGraph architecture as a PNG image."""
     try:
         img_bytes = graph.get_graph().draw_mermaid_png()
@@ -117,12 +119,13 @@ async def get_graph_image(user_payload: dict = Depends(verify_token)):
 
 @app.post("/api/report")
 async def generate_financial_report(
-    files: List[UploadFile] = File(...),
-    user_payload: dict = Depends(verify_token)
+    files: List[UploadFile] = File(...)
+    # user_payload: dict = Depends(verify_token)
 ):
     """Upload one or more financial documents and generate a report."""
 
-    print(f"[API] Apel efectuat de clientul: {user_payload.get('azp', 'Necunoscut')}")
+    # print(f"[API] Apel efectuat de clientul: {user_payload.get('azp', 'Necunoscut')}")
+    print("[API] Apel efectuat (validare token dezactivata)")
 
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded.")
