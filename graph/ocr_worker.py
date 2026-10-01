@@ -21,39 +21,23 @@ _NUM_WORKERS = min(4, os.cpu_count() or 4)
 
 _DATE_LINE_RE = re.compile(r"^\s*\d{1,4}[./-]\d{1,2}[./-]\d{1,4}")
 
+import threading
+
 _ocr = None
+_ocr_lock = threading.Lock()
 
-
-def _init_worker():
-    """Called once when a worker process starts. Loads PaddleOCR into this process."""
+def _get_ocr():
     global _ocr
-    from paddleocr import PaddleOCR
-    _ocr = PaddleOCR(lang="en")
-
-
-def _merge_continuation_lines(lines_text: list[str]) -> list[str]:
-    """Merge OCR rows that don't start with a date into the previous row."""
-    merged: list[str] = []
-    for line in lines_text:
-        if _DATE_LINE_RE.match(line) or not merged:
-            merged.append(line)
-        else:
-            merged[-1] = f"{merged[-1]}\n{line}"
-    return merged
-
+    if _ocr is None:
+        with _ocr_lock:
+            if _ocr is None:
+                from paddleocr import PaddleOCR
+                # Setează use_gpu=True explicit sau lasă-l să detecteze automat
+                _ocr = PaddleOCR(lang="en", use_angle_cls=False)
+    return _ocr
 
 def _process_single_image(args: tuple) -> tuple[int, str]:
-    """Process a single image in an isolated worker process.
-    
-    Args:
-        args: (img_b64, doc_index, total_docs)
-    
-    Returns:
-        (doc_index, extracted_text) — doc_index is passed through to preserve ordering.
-    """
-    global _ocr
     img_b64, doc_index, total_docs = args
-
 
     img_bytes = base64.b64decode(img_b64)
     image = Image.open(io.BytesIO(img_bytes))
@@ -63,11 +47,15 @@ def _process_single_image(args: tuple) -> tuple[int, str]:
     img_array = np.array(image)
     img_array = img_array[:, :, ::-1]
 
-    result = _ocr.ocr(img_array)
+    ocr_instance = _get_ocr()
     
-    print(f"[DEBUG-OCR-WORKER pid={os.getpid()}] Raw result length: {len(result) if result else 'None'}")
+    # PaddleOCR nu este complet thread-safe, așa că blocăm execuția pe durata inferenței
+    with _ocr_lock:
+        result = ocr_instance.ocr(img_array)
+    
+    print(f"[DEBUG-OCR] Raw result length: {len(result) if result else 'None'}")
     if result and result[0]:
-        print(f"[DEBUG-OCR-WORKER pid={os.getpid()}] First page items count: {len(result[0])}")
+        print(f"[DEBUG-OCR] First page items count: {len(result[0])}")
 
     items = []
 
@@ -118,66 +106,24 @@ def _process_single_image(args: tuple) -> tuple[int, str]:
     doc_label = f"--- Document {doc_index + 1} / {total_docs} ---"
     full_text = f"{doc_label}\n{page_text}"
 
-    print(f"[OCR-WORKER pid={os.getpid()}] Processed document {doc_index + 1}/{total_docs}"
+    print(f"[OCR] Processed document {doc_index + 1}/{total_docs}"
           f" — {len(lines_text)} rows reconstructed")
 
     return (doc_index, full_text)
 
 
-_pool = None
-
-
-def _get_pool() -> ProcessPoolExecutor:
-    """Get or create the process pool (lazy init)."""
-    global _pool
-    if _pool is None:
-        # Pre-initialize in main process to ensure models are downloaded synchronously
-        # without race conditions from multiple workers.
-        from paddleocr import PaddleOCR
-        _ = PaddleOCR(lang="en")
-        
-        _pool = ProcessPoolExecutor(
-            max_workers=_NUM_WORKERS,
-            initializer=_init_worker,
-        )
-    return _pool
-
-
 def run_ocr_single(img_b64: str, doc_index: int, total_docs: int) -> str:
-    """Run OCR on a single image using an isolated worker process.
-
-    Designed to be called from concurrent LangGraph Send() threads — each thread
-    submits its own task to the shared pool and blocks until the worker process
-    returns the result. Because the pool has _NUM_WORKERS processes, up to
-    _NUM_WORKERS documents are OCR-d simultaneously in truly isolated memory.
-
-    Returns:
-        extracted text for this document
+    """Run OCR on a single image.
+    Uses a thread lock to prevent internal C++ buffer corruption.
     """
-    pool = _get_pool()
-    future = pool.submit(_process_single_image, (img_b64, doc_index, total_docs))
-    _, text = future.result()
+    _, text = _process_single_image((img_b64, doc_index, total_docs))
     return text
 
 
 def run_ocr_parallel(tasks: list[tuple[str, int, int]]) -> list[str]:
-    """Run OCR on multiple images in parallel using separate processes.
-
-    Submits all tasks to the pool at once and collects results ordered by
-    doc_index. Use this when you have all documents available upfront.
-
-    Args:
-        tasks: list of (img_b64, doc_index, total_docs) tuples
-
-    Returns:
-        list of extracted texts, ordered by doc_index
-    """
-    pool = _get_pool()
-    futures = [pool.submit(_process_single_image, task) for task in tasks]
-
     results = {}
-    for future in futures:
-        doc_index, text = future.result()
+    for task in tasks:
+        doc_index, text = _process_single_image(task)
         results[doc_index] = text
 
     return [results[i] for i in sorted(results.keys())]
