@@ -17,5 +17,6 @@ dependencies = [
     "python-jose>=3.5.0",
     "python-multipart>=0.0.9",
     "requests>=2.34.2",
+    "setuptools",
     "uvicorn[standard]>=0.30.0",
 ]
