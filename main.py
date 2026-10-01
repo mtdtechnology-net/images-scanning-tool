@@ -4,6 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 import traceback
 import os
+os.environ["FLAGS_cudnn_deterministic"] = "True"
+os.environ["FLAGS_allocator_strategy"] = "auto_growth"
 import requests
 from jose import jwt, JWTError
 from graph.builder import create_graph
