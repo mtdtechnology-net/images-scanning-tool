@@ -32,7 +32,7 @@ def _get_ocr():
     if not hasattr(_thread_local, "ocr_instance"):
         with _ocr_init_lock:
             from paddleocr import PaddleOCR
-            _thread_local.ocr_instance = PaddleOCR(lang="en", use_angle_cls=False, use_gpu=False)
+            _thread_local.ocr_instance = PaddleOCR(lang="en", use_angle_cls=False, use_gpu=True, rec_batch_num=1)
     return _thread_local.ocr_instance
 
 def _merge_continuation_lines(lines_text: list[str]) -> list[str]:
