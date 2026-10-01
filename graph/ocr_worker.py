@@ -32,8 +32,9 @@ def _get_ocr():
         with _ocr_lock:
             if _ocr is None:
                 from paddleocr import PaddleOCR
-                # Reactivăm GPU-ul! Folosim API-ul din PaddleOCR 3.x pentru Blackwell
-                _ocr = PaddleOCR(lang="en", use_textline_orientation=False, device="gpu")
+                # Trecem înapoi pe soluția sigură: OCR pe CPU
+                # (Llama va rula oricum pe GPU și va fi foarte rapid)
+                _ocr = PaddleOCR(lang="en", use_angle_cls=False, use_gpu=False)
     return _ocr
 
 def _merge_continuation_lines(lines_text: list[str]) -> list[str]:
