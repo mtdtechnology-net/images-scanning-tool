@@ -7,7 +7,7 @@ from core.state import FinancialState, DocumentInput, ExtractionResult
 from prompts.index import FINANCIAL_EXTRACTION_PROMPT
 from graph.ocr_worker import run_ocr_single
 
-llm_lock = threading.Lock()
+# (Lock-ul pentru LLM a fost eliminat pentru a permite paralelizarea cererilor către server)
 # llm = ChatOllama(model="llama3.1:8b", temperature=0)
 
 llm = ChatOllama(
@@ -34,8 +34,7 @@ def _run_extraction_on_text(text: str, doc_index: int) -> list:
     import json
     
     try:
-        with llm_lock:
-            response = llm.bind(format="json").invoke([message])
+        response = llm.bind(format="json").invoke([message])
         
         raw_text = response.content.strip()
         if raw_text.startswith("```json"):
