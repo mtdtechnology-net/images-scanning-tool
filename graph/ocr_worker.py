@@ -32,8 +32,8 @@ def _get_ocr():
         with _ocr_lock:
             if _ocr is None:
                 from paddleocr import PaddleOCR
-                # Setează use_gpu=True explicit sau lasă-l să detecteze automat
-                _ocr = PaddleOCR(lang="en", use_angle_cls=False)
+                # Reactivăm GPU-ul! Folosim API-ul din PaddleOCR 3.x pentru Blackwell
+                _ocr = PaddleOCR(lang="en", use_textline_orientation=False, device="gpu")
     return _ocr
 
 def _merge_continuation_lines(lines_text: list[str]) -> list[str]:
@@ -61,7 +61,8 @@ def _process_single_image(args: tuple) -> tuple[int, str]:
     
     # PaddleOCR nu este complet thread-safe, așa că blocăm execuția pe durata inferenței
     with _ocr_lock:
-        result = ocr_instance.ocr(img_array)
+        # Folosim noul API predict() din PaddleOCR 3.x
+        result = ocr_instance.predict(img_array)
     
     print(f"[DEBUG-OCR] Raw result length: {len(result) if result else 'None'}")
     if result and result[0]:
