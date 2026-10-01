@@ -12,7 +12,7 @@ llm_lock = threading.Lock()
 
 llm = ChatOllama(
     model="qwen2.5:1.5b", #
-    base_url="http://192.168.100.56:11434",
+    base_url="http://localhost:11434",
     temperature=0
 )
 
