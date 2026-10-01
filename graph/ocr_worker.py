@@ -23,19 +23,17 @@ _DATE_LINE_RE = re.compile(r"^\s*\d{1,4}[./-]\d{1,2}[./-]\d{1,4}")
 
 import threading
 
-_ocr = None
-_ocr_lock = threading.Lock()
+_thread_local = threading.local()
+_ocr_init_lock = threading.Lock()
 
 def _get_ocr():
-    global _ocr
-    if _ocr is None:
-        with _ocr_lock:
-            if _ocr is None:
-                from paddleocr import PaddleOCR
-                # Trecem înapoi pe soluția sigură: OCR pe CPU
-                # (Llama va rula oricum pe GPU și va fi foarte rapid)
-                _ocr = PaddleOCR(lang="en", use_angle_cls=False, use_gpu=False)
-    return _ocr
+    # PaddleOCR (la nivel de C++) dă crash dacă este apelat din alt thread decât cel în care a fost inițializat.
+    # Folosim threading.local() ca fiecare thread din LangGraph să aibă propria sa instanță OCR.
+    if not hasattr(_thread_local, "ocr_instance"):
+        with _ocr_init_lock:
+            from paddleocr import PaddleOCR
+            _thread_local.ocr_instance = PaddleOCR(lang="en", use_angle_cls=False, use_gpu=False)
+    return _thread_local.ocr_instance
 
 def _merge_continuation_lines(lines_text: list[str]) -> list[str]:
     """Merge OCR rows that don't start with a date into the previous row."""
@@ -58,12 +56,11 @@ def _process_single_image(args: tuple) -> tuple[int, str]:
     img_array = np.array(image)
     img_array = img_array[:, :, ::-1]
 
+    # Obținem instanța specifică acestui thread
     ocr_instance = _get_ocr()
     
-    # PaddleOCR nu este complet thread-safe, așa că blocăm execuția pe durata inferenței
-    with _ocr_lock:
-        # Chiar și în 3.x, metoda principală a rămas .ocr() pentru obiectul de bază
-        result = ocr_instance.ocr(img_array)
+    # Executăm fără lacăt! Acum procesarea pe CPU se va face 100% în paralel pentru mai multe pagini
+    result = ocr_instance.ocr(img_array)
     
     print(f"[DEBUG-OCR] Raw result length: {len(result) if result else 'None'}")
     if result and result[0]:
