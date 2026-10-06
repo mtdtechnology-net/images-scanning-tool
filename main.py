@@ -234,6 +234,130 @@ async def generate_financial_report(
     }
 
 
+@app.post("/api/report-stream")
+async def generate_financial_report_stream(
+    files: List[UploadFile] = File(...)
+):
+    """Upload one or more financial documents and stream progress via SSE (Mobile flow)."""
+
+    print("[API] Apel report-stream efectuat")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
+
+    for file in files:
+        if file.content_type not in SUPPORTED_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {file.content_type} ({file.filename}). Supported: PDF, PNG, JPG, WEBP"
+            )
+        file_bytes = await file.read()
+        if len(file_bytes) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File '{file.filename}' too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)} MB"
+            )
+        await file.seek(0) # reset file pointer
+
+    async def event_generator():
+        try:
+            yield _sse_event("parsing", "Converting documents to images...")
+            
+            all_document_images = []
+            filenames = []
+            
+            for file in files:
+                file_bytes = await file.read()
+                try:
+                    images = await asyncio.to_thread(parse_document_to_images, file_bytes, file.content_type)
+                    all_document_images.extend(images)
+                    filenames.append(file.filename)
+                except Exception as e:
+                    yield _sse_event("error", f"Failed to process '{file.filename}': {str(e)}")
+                    return
+
+            if not all_document_images:
+                yield _sse_event("error", "Could not extract any images from the uploaded documents.")
+                return
+
+            total_docs = len(all_document_images)
+            yield _sse_event("parsed", f"Found {total_docs} pages to process.", {"total_docs": total_docs})
+
+            extracted_expenses = []
+
+            for i, doc_b64 in enumerate(all_document_images):
+                yield _sse_event("ocr", f"Running OCR text recognition for page {i+1}/{total_docs}...", {"current": i+1, "total": total_docs})
+                try:
+                    extracted_text = await asyncio.to_thread(run_ocr_single, doc_b64, i, total_docs)
+                except Exception as e:
+                    yield _sse_event("error", f"OCR failed on page {i+1}: {str(e)}")
+                    return
+
+                print(f"\n{'='*60}\n[OCR-FULL-TEXT] doc_index={i+1}/{total_docs}\n{extracted_text}\n{'='*60}\n")
+
+                yield _sse_event("extracting", f"Extracting data with AI for page {i+1}/{total_docs}...", {"current": i+1, "total": total_docs})
+                try:
+                    result = await asyncio.to_thread(_run_extraction_hybrid, extracted_text, doc_b64, i)
+                except Exception as e:
+                    yield _sse_event("error", f"AI extraction failed on page {i+1}: {str(e)}")
+                    return
+
+                if result == "__INVALID_DOCUMENT__":
+                    extracted_expenses.append("__INVALID_DOCUMENT__")
+                elif isinstance(result, list):
+                    extracted_expenses.extend(result)
+
+            yield _sse_event("formatting", "Formatting report...")
+            
+            # Replicate the mobile report formatting logic
+            if extracted_expenses and extracted_expenses[0] == "__INVALID_DOCUMENT__":
+                yield _sse_event("done", "Extraction complete!", {
+                    "success": False,
+                    "error": "The uploaded document does not appear to be a fiscal receipt or invoice. Please upload a valid receipt.",
+                    "pages_processed": total_docs,
+                    "files": filenames,
+                    "expenses": {},
+                })
+                return
+            
+            expenses_obj = {}
+            if extracted_expenses:
+                # API mobile just takes the first expense
+                exp = extracted_expenses[0]
+                invoice_str = exp.invoice_number_date
+                if exp.receipt_date:
+                    invoice_str = f"{invoice_str} / {exp.receipt_date}"
+                
+                expenses_obj = {
+                    "expense_description": exp.expense_description,
+                    "invoice_number_date": invoice_str,
+                    "expense_amount": exp.expense_amount,
+                    "currency": exp.currency,
+                }
+            
+            yield _sse_event("done", "Extraction complete!", {
+                "success": True,
+                "report": "### Business Trip Expenses Extracted Successfully.",
+                "pages_processed": total_docs,
+                "files": filenames,
+                "expenses": expenses_obj,
+            })
+
+        except Exception as e:
+            traceback.print_exc()
+            yield _sse_event("error", f"Unexpected error: {str(e)}")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
 @app.post("/api/web-report")
 async def generate_web_report(
     files: List[UploadFile] = File(...)
