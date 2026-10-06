@@ -8,6 +8,7 @@ dependencies = [
     "langchain-ollama>=0.2.0",
     "langgraph>=0.2.0",
     "numpy>=1.24.0",
+    "opencv-contrib-python>=4.10.0.84",
     "paddleocr>=2.7.0",
     "paddlepaddle-gpu>=2.6.0",
     "pillow>=10.0.0",

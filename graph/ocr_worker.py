@@ -1,23 +1,25 @@
-"""OCR worker module — runs in separate processes via ProcessPoolExecutor.
+"""OCR worker module — thread-safe with per-thread PaddleOCR instances.
 
-Each worker process has its own PaddleOCR instance in completely isolated
-memory. This solves the thread-safety issue where PaddlePaddle's internal
-C++ buffers get corrupted when multiple threads call ocr.ocr() concurrently.
+Each thread gets its own PaddleOCR instance via threading.local() to avoid
+C++ buffer corruption when LangGraph runs multiple document processing
+nodes concurrently.
+
+Includes:
+- Image preprocessing pipeline (auto-crop, enhance, etc.)
+- OCR text reconstruction with row merging
 
 Usage from nodes.py:
-    from graph.ocr_worker import run_ocr_parallel
-    results = run_ocr_parallel([(b64, idx, total), ...])
+    from graph.ocr_worker import run_ocr_single
+    text = run_ocr_single(b64, idx, total)
 """
 import base64
 import io
 import re
 import os
-from concurrent.futures import ProcessPoolExecutor
 from PIL import Image
 import numpy as np
+from graph.preprocess import preprocess_for_ocr
 
-
-_NUM_WORKERS = min(4, os.cpu_count() or 4)
 
 _DATE_LINE_RE = re.compile(r"^\s*\d{1,4}[./-]\d{1,2}[./-]\d{1,4}")
 
@@ -27,8 +29,12 @@ _thread_local = threading.local()
 _ocr_init_lock = threading.Lock()
 
 def _get_ocr():
-    # PaddleOCR (la nivel de C++) dă crash dacă este apelat din alt thread decât cel în care a fost inițializat.
-    # Folosim threading.local() ca fiecare thread din LangGraph să aibă propria sa instanță OCR.
+    """Get or create a PaddleOCR instance for the current thread.
+    
+    PaddleOCR's C++ internals crash if called from a different thread
+    than the one that created the instance. We use threading.local()
+    so each LangGraph worker thread gets its own isolated instance.
+    """
     if not hasattr(_thread_local, "ocr_instance"):
         with _ocr_init_lock:
             from paddleocr import PaddleOCR
@@ -53,13 +59,13 @@ def _process_single_image(args: tuple) -> tuple[int, str]:
     if image.mode != "RGB":
         image = image.convert("RGB")
 
+    # --- NEW: Preprocessing pipeline (auto-crop, enhance, cap size) ---
+    image = preprocess_for_ocr(image)
+
     img_array = np.array(image)
     img_array = img_array[:, :, ::-1]
 
-    # Obținem instanța specifică acestui thread
     ocr_instance = _get_ocr()
-    
-    # Executăm fără lacăt! Acum procesarea pe CPU se va face 100% în paralel pentru mai multe pagini
     result = ocr_instance.ocr(img_array)
     
     print(f"[DEBUG-OCR] Raw result length: {len(result) if result else 'None'}")
@@ -112,6 +118,7 @@ def _process_single_image(args: tuple) -> tuple[int, str]:
     lines_text = _merge_continuation_lines(lines_text)
 
     page_text = "\n".join(lines_text)
+
     doc_label = f"--- Document {doc_index + 1} / {total_docs} ---"
     full_text = f"{doc_label}\n{page_text}"
 
@@ -122,18 +129,16 @@ def _process_single_image(args: tuple) -> tuple[int, str]:
 
 
 def run_ocr_single(img_b64: str, doc_index: int, total_docs: int) -> str:
-    """Run OCR on a single image.
-    Uses a thread lock to prevent internal C++ buffer corruption.
-    """
+    """Run OCR on a single image (thread-safe via threading.local)."""
     _, text = _process_single_image((img_b64, doc_index, total_docs))
     return text
 
 
 def run_ocr_parallel(tasks: list[tuple[str, int, int]]) -> list[str]:
+    """Run OCR on multiple images sequentially (each in its own thread-local context)."""
     results = {}
     for task in tasks:
         doc_index, text = _process_single_image(task)
         results[doc_index] = text
 
     return [results[i] for i in sorted(results.keys())]
-

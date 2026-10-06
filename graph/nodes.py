@@ -1,22 +1,47 @@
 import re
+import json
 import threading
 from typing import Optional
+from collections import Counter
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage
-from core.state import FinancialState, DocumentInput, ExtractionResult
+from core.state import FinancialState, DocumentInput, ExtractionResult, BusinessTripExpense
 from prompts.index import FINANCIAL_EXTRACTION_PROMPT
 from graph.ocr_worker import run_ocr_single
 
-# (Lock-ul pentru LLM a fost eliminat pentru a permite paralelizarea cererilor către server)
-# llm = ChatOllama(model="llama3.1:8b", temperature=0)
-
 llm = ChatOllama(
-    model="llama3.1:8b", #
+    model="llama3.2-vision:latest",
     base_url="http://localhost:11434",
     temperature=0
 )
 
 _DATE_LINE_RE = re.compile(r"^\s*\d{1,4}[./-]\d{1,2}[./-]\d{1,4}")
+
+_INVALID_DOC_ERROR = "__INVALID_DOCUMENT__"
+
+
+_DATE_PATTERNS = [
+    r'\d{1,2}[.]\d{1,2}[.]\d{2,4}',            # 08.07.2026
+    r'\d{1,2}/\d{1,2}/\d{2,4}',                 # 08/07/2026
+    r'\d{4}\s*-\s*\d{2}\s*-\s*\d{2}',           # 2026-07-08
+    r'\d{1,2}\s*-\s*[A-Z]{3}\s*-\s*\d{4}',      # 20-NOV-2024
+    r'\d{1,2}\s+[A-Z]{3}\s+\d{4}',              # 20 NOV 2024
+]
+
+
+def _validate_receipt_date(receipt_date: str, ocr_text: str) -> bool:
+    """Verify that a date pattern actually exists in the OCR text.
+    
+    Prevents the LLM from hallucinating dates that don't appear
+    on the actual receipt. Returns True only if the OCR text
+    contains recognizable date patterns.
+    """
+    ocr_upper = ocr_text.upper()
+    for pattern in _DATE_PATTERNS:
+        if re.search(pattern, ocr_upper):
+            return True
+    return False
+
 
 def merge_continuation_lines(lines_text: list[str]) -> list[str]:
     merged: list[str] = []
@@ -27,16 +52,35 @@ def merge_continuation_lines(lines_text: list[str]) -> list[str]:
             merged[-1] = f"{merged[-1]}\n{line}"
     return merged
 
-def _run_extraction_on_text(text: str, doc_index: int) -> list:
-    """Run LLM structured extraction on OCR text. Returns list of BusinessTripExpense objects."""
-    prompt = FINANCIAL_EXTRACTION_PROMPT.format(text=text)
-    message = HumanMessage(content=prompt)
-    import json
+
+# ─── Hybrid Extraction (OCR text + image → LLM) ─────────────────────────────
+
+def _run_extraction_hybrid(text: str, image_b64: str, doc_index: int) -> list:
+    """Run multimodal LLM structured extraction using both OCR text and the image.
     
+    The LLM receives:
+    1. The raw OCR text (perfect for numbers, amounts, dates)
+    2. The original image (perfect for logos, layout, visual context)
+    
+    This hybrid approach lets the LLM cross-reference visual cues with exact
+    text strings, producing much more accurate extractions than either alone.
+    
+    Returns a list of BusinessTripExpense objects or an error marker.
+    """
+    prompt = FINANCIAL_EXTRACTION_PROMPT.format(text=text)
+
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": f"data:image/jpeg;base64,{image_b64}"},
+        ]
+    )
+
     try:
         response = llm.bind(format="json").invoke([message])
         
         raw_text = response.content.strip()
+
         if raw_text.startswith("```json"):
             raw_text = raw_text[7:]
         if raw_text.startswith("```"):
@@ -46,7 +90,6 @@ def _run_extraction_on_text(text: str, doc_index: int) -> list:
         raw_text = raw_text.strip()
 
         data = json.loads(raw_text)
-        from core.state import BusinessTripExpense
         
         if isinstance(data, dict) and data.get("valid") is False:
             print(f"[LLM] Document {doc_index + 1} rejected: not a fiscal receipt")
@@ -57,7 +100,6 @@ def _run_extraction_on_text(text: str, doc_index: int) -> list:
         elif isinstance(data, list):
             txs_data = data
         elif isinstance(data, dict):
-
             data.pop("valid", None)
             txs_data = [data]
         else:
@@ -67,23 +109,32 @@ def _run_extraction_on_text(text: str, doc_index: int) -> list:
         expenses = []
         for t_data in txs_data:
             try:
-                expenses.append(BusinessTripExpense(**t_data))
+                exp = BusinessTripExpense(**t_data)
+
+                # ── Guardrail 1: validate receipt_date against OCR text ──
+                if exp.receipt_date:
+                    if not _validate_receipt_date(exp.receipt_date, text):
+                        print(f"  [Guardrail] receipt_date '{exp.receipt_date}' NOT found in OCR text — setting to ''")
+                        exp.receipt_date = ""
+
+                # ── Guardrail 2: post-fix extract receipt_date from OCR if LLM missed it ──
+                if not exp.receipt_date:
+                    date_pattern = re.compile(r"\b(\d{2}[./]\d{2}[./]\d{4})\b")
+                    all_dates = date_pattern.findall(text)
+                    if all_dates:
+
+                        exp.receipt_date = all_dates[-1]
+                        print(f"  [Guardrail] Extracted receipt_date from OCR: {exp.receipt_date}")
+
+                expenses.append(exp)
             except Exception as val_e:
                 print(f"[LLM] Validation error for an expense: {val_e}")
 
-        # Post-fix: extract receipt date deterministically from OCR text
-        # Small models often miss it, so we use regex instead
-        date_pattern = re.compile(r"\b(\d{2}[./]\d{2}[./]\d{4})\b")
-        for exp in expenses:
-            if not exp.receipt_date:
-                all_dates = date_pattern.findall(text)
-                if all_dates:
-                    # Use the last date found (usually the receipt print date near the bottom)
-                    exp.receipt_date = all_dates[-1]
-                    print(f"  [Post-fix] Extracted receipt_date: {exp.receipt_date}")
-
         if expenses:
             print(f"[LLM] Extracted {len(expenses)} expenses from document {doc_index + 1}")
+            for exp in expenses:
+                print(f"  → {exp.expense_description} | {exp.expense_amount} {exp.currency} | "
+                      f"cat={exp.expense_category} | city={exp.vendor_city} | date={exp.receipt_date}")
             return expenses
         else:
             print(f"[LLM] No valid expenses found in document {doc_index + 1}")
@@ -94,18 +145,23 @@ def _run_extraction_on_text(text: str, doc_index: int) -> list:
         return []
 
 
-_INVALID_DOC_ERROR = "__INVALID_DOCUMENT__"
-
+# ─── LangGraph Node: process_document ────────────────────────────────────────
 
 def process_document(state: DocumentInput) -> dict:
+    """Process a single document: Preprocess → OCR → Hybrid LLM extraction.
+    
+    Called by LangGraph via Send() for each document in parallel.
+    """
     doc_b64 = state["doc_b64"]
     doc_index = state["doc_index"]
     total_docs = state["total_docs"]
 
+    # Step 1: OCR (includes preprocessing pipeline internally)
     extracted_text = run_ocr_single(doc_b64, doc_index, total_docs)
     print(f"\n{'='*60}\n[OCR-FULL-TEXT] doc_index={doc_index+1}/{total_docs}\n{extracted_text}\n{'='*60}\n")
 
-    result = _run_extraction_on_text(extracted_text, doc_index)
+    # Step 2: Hybrid extraction (OCR text + original image → LLM)
+    result = _run_extraction_hybrid(extracted_text, doc_b64, doc_index)
 
     # If the AI rejected the document, pass the error marker through
     if result == _INVALID_DOC_ERROR:
@@ -121,11 +177,16 @@ def process_document(state: DocumentInput) -> dict:
         "extracted_expenses": result,
     }
 
+
+# ─── LangGraph Node: generate_report ─────────────────────────────────────────
+
 def generate_report(state: FinancialState) -> dict:
     """Format expenses into report dict."""
     report = "### Business Trip Expenses Extracted Successfully."
     return {"report": report}
 
+
+# ─── Utility: deduce transport type ──────────────────────────────────────────
 
 def _deduce_means_of_transport(description: str) -> str:
     """Deduce meansOfTransport from expense description.
@@ -160,6 +221,8 @@ def _deduce_means_of_transport(description: str) -> str:
     return "Other"
 
 
+# ─── LangGraph Node: aggregate_web_expenses ──────────────────────────────────
+
 def aggregate_web_expenses(state: FinancialState) -> dict:
     """Aggregate all extracted expenses into web form structure.
 
@@ -167,8 +230,6 @@ def aggregate_web_expenses(state: FinancialState) -> dict:
     sums up the totals per category, deduces the trip location from
     vendor addresses, and builds the accommodation and transport tables.
     """
-    from collections import Counter
-
     expenses = state.get("extracted_expenses", [])
 
     transport_total = 0.0
