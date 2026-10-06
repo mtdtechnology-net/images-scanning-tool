@@ -290,8 +290,18 @@ def aggregate_web_expenses(state: FinancialState) -> dict:
             "vendor_country": vendor_country,
         })
 
-    # Deduce the most likely trip location from all vendor addresses
-    location = Counter(cities).most_common(1)[0][0] if cities else ""
+    # Deduce the trip location prioritizing accommodation city
+    location = ""
+    for exp in expenses:
+        if exp == "__INVALID_DOCUMENT__":
+            continue
+        if getattr(exp, "expense_category", "other") == "accommodation" and getattr(exp, "vendor_city", ""):
+            location = exp.vendor_city
+            break
+
+    if not location:
+        location = Counter(cities).most_common(1)[0][0] if cities else ""
+
     country = Counter(countries).most_common(1)[0][0] if countries else ""
 
     # Estimate per diem (50 RON per day)
