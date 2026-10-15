@@ -10,7 +10,7 @@ from prompts.index import FINANCIAL_EXTRACTION_PROMPT
 from graph.ocr_worker import run_ocr_single
 
 llm = ChatOllama(
-    model="llama3.2-vision:latest",
+    model="qwen3-vl:8b-instruct",
     base_url="http://localhost:11434",
     temperature=0
 )
