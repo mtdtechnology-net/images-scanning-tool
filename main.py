@@ -535,6 +535,12 @@ async def generate_web_report_stream(
                 yield _sse_event("error", "The AI could not extract any expenses from the uploaded documents.")
                 return
 
+            print("done", "Extraction complete!", {
+                "pages_processed": total_docs,
+                "files": filenames,
+                **web_result
+            })
+
             yield _sse_event("done", "Extraction complete!", {
                 "pages_processed": total_docs,
                 "files": filenames,
