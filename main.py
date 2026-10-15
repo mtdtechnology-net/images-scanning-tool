@@ -334,6 +334,14 @@ async def generate_financial_report_stream(
                     "expense_amount": exp.expense_amount,
                     "currency": exp.currency,
                 }
+
+                print("done", "Extraction complete!", {
+                "success": True,
+                "report": "### Business Trip Expenses Extracted Successfully.",
+                "pages_processed": total_docs,
+                "files": filenames,
+                "expenses": expenses_obj,
+            })
             
             yield _sse_event("done", "Extraction complete!", {
                 "success": True,
