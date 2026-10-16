@@ -10,7 +10,7 @@ CRITICAL INSTRUCTIONS:
    {{"valid": false}}
 
 2. If it IS a valid receipt/invoice, extract EXACTLY ONE expense and return:
-   {{"valid": true, "expense_description": "...", "invoice_number_date": "...", "expense_amount": ..., "currency": "...", "expense_category": "...", "vendor_city": "...", "vendor_country": "...", "number_of_nights": ...}}
+   {{"valid": true, "expense_description": "...", "invoice_number_date": "...", "expense_amount": ..., "currency": "...", "expense_category": "...", "vendor_city": "...", "vendor_country": "...", "number_of_nights": ..., "check_in_date": "...", "check_out_date": "..."}}
 
 3. Extracted Fields (only when valid is true):
    - expense_description: A short description based on the vendor or main item.
@@ -33,13 +33,19 @@ CRITICAL INSTRUCTIONS:
      * "accommodation" — hotel, hostel, airbnb, motel, lodging, room rental
      * "other" — anything that is neither transport nor accommodation
 
-   - vendor_city: The city where the physical service was provided.
-     * CRITICAL for gas stations: Look for the actual station location (e.g. "SIBIU", "CLUJ"), DO NOT extract the corporate headquarters (which is often "BUCURESTI").
+   - vendor_city: The city where the physical service was provided, written in Title Case (e.g. "Sibiu", "Cluj-Napoca", NOT all caps).
+     * CRITICAL for gas stations: Look for the actual station location (e.g. "Sibiu", "Cluj"), DO NOT extract the corporate headquarters (which is often "Bucuresti").
      * If not visible, return "".
 
    - vendor_country: The country inferred from address, currency, or language.
 
    - number_of_nights: ONLY for accommodation receipts. For non-accommodation receipts, this MUST be 0.
+
+   - check_in_date: Check-in / arrival date (e.g. "2026-10-01" or "01.10.2026").
+     * ONLY for accommodation receipts. For non-accommodation receipts, this MUST be "".
+
+   - check_out_date: Check-out / departure date (e.g. "2026-10-04" or "04.10.2026").
+     * ONLY for accommodation receipts. For non-accommodation receipts, this MUST be "".
 
    - receipt_date: The date the transaction occurred, extracted from the receipt.
      * This MUST be a date that actually appears in the OCR text.

@@ -18,6 +18,8 @@ class BusinessTripExpense(BaseModel):
     vendor_city: str = ""            # city extracted from vendor address
     vendor_country: str = ""         # country extracted from vendor address
     number_of_nights: int = 0        # only for accommodation invoices
+    check_in_date: str = ""          # check-in / arrival date (for accommodation)
+    check_out_date: str = ""         # check-out / departure date (for accommodation)
 
 class ExtractionResult(BaseModel):
     expenses: list[BusinessTripExpense]

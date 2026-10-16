@@ -1,6 +1,7 @@
 import re
 import json
 import threading
+import datetime
 from typing import Optional
 from collections import Counter
 from langchain_ollama import ChatOllama
@@ -27,6 +28,71 @@ _DATE_PATTERNS = [
     r'\d{1,2}\s*-\s*[A-Z]{3}\s*-\s*\d{4}',      # 20-NOV-2024
     r'\d{1,2}\s+[A-Z]{3}\s+\d{4}',              # 20 NOV 2024
 ]
+ 
+ 
+_ROMANIAN_MONTHS = {
+    "ian": 1, "ianuarie": 1, "jan": 1, "january": 1,
+    "feb": 2, "februarie": 2, "february": 2,
+    "mar": 3, "martie": 3, "march": 3,
+    "apr": 4, "aprilie": 4, "april": 4,
+    "mai": 5, "may": 5,
+    "iun": 6, "iunie": 6, "june": 6,
+    "iul": 7, "iulie": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "septembrie": 9, "september": 9,
+    "oct": 10, "octombrie": 10, "october": 10,
+    "noi": 11, "nov": 11, "noiembrie": 11, "november": 11,
+    "dec": 12, "decembrie": 12, "december": 12,
+}
+
+
+def _parse_flexible_date(date_str: str) -> Optional[datetime.date]:
+    """Parse flexible date strings (YYYY-MM-DD, DD.MM.YYYY, DD Month YYYY, etc.) into datetime.date."""
+    if not date_str:
+        return None
+    s = str(date_str).strip()
+
+    # 1. YYYY-MM-DD or YYYY.MM.DD or YYYY/MM/DD
+    m1 = re.match(r"^(\d{4})[./-](\d{1,2})[./-](\d{1,2})", s)
+    if m1:
+        try:
+            return datetime.date(int(m1.group(1)), int(m1.group(2)), int(m1.group(3)))
+        except ValueError:
+            pass
+
+    # 2. DD.MM.YYYY or DD/MM/YYYY or DD-MM-YYYY
+    m2 = re.match(r"^(\d{1,2})[./-](\d{1,2})[./-](\d{4})", s)
+    if m2:
+        try:
+            return datetime.date(int(m2.group(3)), int(m2.group(2)), int(m2.group(1)))
+        except ValueError:
+            pass
+
+    # 3. DD MonthName YYYY (e.g. 01 Octombrie 2026, 20-NOV-2024, 01 Oct 2026)
+    m3 = re.search(r"(\d{1,2})[\s\-\./]+([a-zA-ZăîșțĂÎȘȚ]{3,})[\s\-\./]+(\d{4})", s)
+    if m3:
+        day = int(m3.group(1))
+        month_word = m3.group(2).lower()
+        year = int(m3.group(3))
+        for k, v in _ROMANIAN_MONTHS.items():
+            if month_word.startswith(k) or k.startswith(month_word):
+                try:
+                    return datetime.date(year, v, day)
+                except ValueError:
+                    pass
+                break
+
+    # 4. DD.MM.YY
+    m4 = re.match(r"^(\d{1,2})[./-](\d{1,2})[./-](\d{2})$", s)
+    if m4:
+        try:
+            yy = int(m4.group(3))
+            year = 2000 + yy if yy < 70 else 1900 + yy
+            return datetime.date(year, int(m4.group(2)), int(m4.group(1)))
+        except ValueError:
+            pass
+
+    return None
 
 
 def _validate_receipt_date(receipt_date: str, ocr_text: str) -> bool:
@@ -126,6 +192,17 @@ def _run_extraction_hybrid(text: str, image_b64: str, doc_index: int) -> list:
                         exp.receipt_date = all_dates[-1]
                         print(f"  [Guardrail] Extracted receipt_date from OCR: {exp.receipt_date}")
 
+                # Format city and country in Title Case (e.g. SIBIU -> Sibiu)
+                if exp.vendor_city:
+                    exp.vendor_city = exp.vendor_city.strip().title()
+                if exp.vendor_country:
+                    exp.vendor_country = exp.vendor_country.strip().title()
+
+                # Ensure check_in_date and check_out_date are only kept for accommodation
+                if exp.expense_category != "accommodation":
+                    exp.check_in_date = ""
+                    exp.check_out_date = ""
+
                 expenses.append(exp)
             except Exception as val_e:
                 print(f"[LLM] Validation error for an expense: {val_e}")
@@ -134,7 +211,8 @@ def _run_extraction_hybrid(text: str, image_b64: str, doc_index: int) -> list:
             print(f"[LLM] Extracted {len(expenses)} expenses from document {doc_index + 1}")
             for exp in expenses:
                 print(f"  → {exp.expense_description} | {exp.expense_amount} {exp.currency} | "
-                      f"cat={exp.expense_category} | city={exp.vendor_city} | date={exp.receipt_date}")
+                      f"cat={exp.expense_category} | city={exp.vendor_city} | date={exp.receipt_date} | "
+                      f"check_in={exp.check_in_date} | check_out={exp.check_out_date}")
             return expenses
         else:
             print(f"[LLM] No valid expenses found in document {doc_index + 1}")
@@ -259,7 +337,12 @@ def aggregate_web_expenses(state: FinancialState) -> dict:
 
         # Collect location data from all receipts
         vendor_city = getattr(exp, "vendor_city", "")
+        if vendor_city:
+            vendor_city = vendor_city.strip().title()
         vendor_country = getattr(exp, "vendor_country", "")
+        if vendor_country:
+            vendor_country = vendor_country.strip().title()
+
         if vendor_city:
             cities.append(vendor_city)
         if vendor_country:
@@ -270,6 +353,8 @@ def aggregate_web_expenses(state: FinancialState) -> dict:
             accommodation_list.append({
                 "accommodationName": exp.expense_description,
                 "numberOfNights": getattr(exp, "number_of_nights", 1) or 1,
+                "checkInDate": getattr(exp, "check_in_date", ""),
+                "checkOutDate": getattr(exp, "check_out_date", ""),
             })
 
         # Build transport entries from transport receipts
@@ -283,6 +368,8 @@ def aggregate_web_expenses(state: FinancialState) -> dict:
             "expense_description": exp.expense_description,
             "invoice_number_date": exp.invoice_number_date,
             "receipt_date": exp.receipt_date,
+            "check_in_date": getattr(exp, "check_in_date", ""),
+            "check_out_date": getattr(exp, "check_out_date", ""),
             "expense_amount": exp.expense_amount,
             "currency": exp.currency,
             "expense_category": category,
@@ -302,16 +389,81 @@ def aggregate_web_expenses(state: FinancialState) -> dict:
     if not location:
         location = Counter(cities).most_common(1)[0][0] if cities else ""
 
-    country = Counter(countries).most_common(1)[0][0] if countries else ""
+    if location:
+        location = location.strip().title()
 
-    # Estimate per diem (50 RON per day)
-    # Trip days is usually total nights + 1. If no nights, assume a 1-day trip.
-    total_nights = sum(acc.get("numberOfNights", 1) for acc in accommodation_list)
-    trip_days = total_nights + 1 if total_nights > 0 else 1
-    per_diem_cost = trip_days * 50.0
+    country = Counter(countries).most_common(1)[0][0] if countries else ""
+    if country:
+        country = country.strip().title()
+
+    # ─── Deduce startDate and endDate ────────────────────────────────────────
+    start_date = ""
+    end_date = ""
+
+    # Strategy 1: Prioritize accommodation dates (check_in_date / check_out_date)
+    acc_check_ins = []
+    acc_check_outs = []
+    for exp in expenses:
+        if exp == "__INVALID_DOCUMENT__":
+            continue
+        if getattr(exp, "expense_category", "other") == "accommodation":
+            ci = getattr(exp, "check_in_date", "")
+            co = getattr(exp, "check_out_date", "")
+            ci_d = _parse_flexible_date(ci)
+            co_d = _parse_flexible_date(co)
+
+            nights = getattr(exp, "number_of_nights", 0) or 1
+            if ci_d and not co_d and nights > 0:
+                co_d = ci_d + datetime.timedelta(days=nights)
+
+            # If check-in is not specified, attempt receipt_date of accommodation
+            if not ci_d:
+                rc_d = _parse_flexible_date(exp.receipt_date)
+                if rc_d:
+                    ci_d = rc_d
+                    if not co_d and nights > 0:
+                        co_d = ci_d + datetime.timedelta(days=nights)
+
+            if ci_d:
+                acc_check_ins.append(ci_d)
+            if co_d:
+                acc_check_outs.append(co_d)
+
+    if acc_check_ins:
+        start_date = min(acc_check_ins).strftime("%Y-%m-%d")
+        if acc_check_outs:
+            end_date = max(acc_check_outs).strftime("%Y-%m-%d")
+        else:
+            end_date = start_date
+
+    # Strategy 2: Fallback to receipt_date across all documents if no accommodation dates
+    if not start_date or not end_date:
+        all_receipt_dates = []
+        for exp in expenses:
+            if exp == "__INVALID_DOCUMENT__":
+                continue
+            rd = _parse_flexible_date(exp.receipt_date)
+            if rd:
+                all_receipt_dates.append(rd)
+
+        if all_receipt_dates:
+            if not start_date:
+                start_date = min(all_receipt_dates).strftime("%Y-%m-%d")
+            if not end_date:
+                end_date = max(all_receipt_dates).strftime("%Y-%m-%d")
+
+    # Estimate per diem (55 RON per day) only if accommodation is present
+    if accommodation_list:
+        total_nights = sum(acc.get("numberOfNights", 1) for acc in accommodation_list)
+        trip_days = total_nights + 1 if total_nights > 0 else 1
+        per_diem_cost = trip_days * 55.0
+    else:
+        per_diem_cost = 0.0
 
     return {
         "web_result": {
+            "startDate": start_date,
+            "endDate": end_date,
             "transportCost": round(transport_total, 2),
             "accommodationCost": round(accommodation_total, 2),
             "otherCosts": round(other_total, 2),
