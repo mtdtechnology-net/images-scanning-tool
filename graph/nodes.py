@@ -1,24 +1,30 @@
 import re
-import json
-import threading
+import logging
 import datetime
 from typing import Optional
 from collections import Counter
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage
-from core.state import FinancialState, DocumentInput, ExtractionResult, BusinessTripExpense
+from pydantic import ValidationError
+from core.config import (
+    OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_NUM_CTX, OLLAMA_KEEP_ALIVE, OLLAMA_TIMEOUT,
+)
+from core.state import BusinessTripExpense, LLMExtraction
 from prompts.index import FINANCIAL_EXTRACTION_PROMPT
-from graph.ocr_worker import run_ocr_single
+
+logger = logging.getLogger(__name__)
 
 llm = ChatOllama(
-    model="qwen3-vl:8b-instruct",
-    base_url="http://localhost:11434",
-    temperature=0
+    model=OLLAMA_MODEL,
+    base_url=OLLAMA_BASE_URL,
+    temperature=0,
+    num_ctx=OLLAMA_NUM_CTX,
+    keep_alive=OLLAMA_KEEP_ALIVE,
+    format=LLMExtraction.model_json_schema(),
+    client_kwargs={"timeout": OLLAMA_TIMEOUT},
 )
 
-_DATE_LINE_RE = re.compile(r"^\s*\d{1,4}[./-]\d{1,2}[./-]\d{1,4}")
-
-_INVALID_DOC_ERROR = "__INVALID_DOCUMENT__"
+INVALID_DOC_ERROR = "__INVALID_DOCUMENT__"
 
 
 _DATE_PATTERNS = [
@@ -109,29 +115,21 @@ def _validate_receipt_date(receipt_date: str, ocr_text: str) -> bool:
     return False
 
 
-def merge_continuation_lines(lines_text: list[str]) -> list[str]:
-    merged: list[str] = []
-    for line in lines_text:
-        if _DATE_LINE_RE.match(line) or not merged:
-            merged.append(line)
-        else:
-            merged[-1] = f"{merged[-1]}\n{line}"
-    return merged
-
-
 # ─── Hybrid Extraction (OCR text + image → LLM) ─────────────────────────────
 
-def _run_extraction_hybrid(text: str, image_b64: str, doc_index: int) -> list:
+async def run_extraction_hybrid(text: str, image_b64: str, doc_index: int) -> list | str:
     """Run multimodal LLM structured extraction using both OCR text and the image.
-    
+
     The LLM receives:
     1. The raw OCR text (perfect for numbers, amounts, dates)
     2. The original image (perfect for logos, layout, visual context)
-    
+
     This hybrid approach lets the LLM cross-reference visual cues with exact
     text strings, producing much more accurate extractions than either alone.
-    
-    Returns a list of BusinessTripExpense objects or an error marker.
+
+    Returns a list of BusinessTripExpense objects or the invalid-document marker.
+    Connection errors / timeouts to Ollama are raised, not swallowed, so the
+    client sees a real error instead of "no expenses found".
     """
     prompt = FINANCIAL_EXTRACTION_PROMPT.format(text=text)
 
@@ -142,126 +140,48 @@ def _run_extraction_hybrid(text: str, image_b64: str, doc_index: int) -> list:
         ]
     )
 
+    response = await llm.ainvoke([message])
+    meta = response.response_metadata or {}
+    logger.info("LLM page %d: prompt_tokens=%s output_tokens=%s",
+                doc_index + 1, meta.get("prompt_eval_count"), meta.get("eval_count"))
+
     try:
-        response = llm.bind(format="json").invoke([message])
-        
-        raw_text = response.content.strip()
-
-        if raw_text.startswith("```json"):
-            raw_text = raw_text[7:]
-        if raw_text.startswith("```"):
-            raw_text = raw_text[3:]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[:-3]
-        raw_text = raw_text.strip()
-
-        data = json.loads(raw_text)
-        
-        if isinstance(data, dict) and data.get("valid") is False:
-            print(f"[LLM] Document {doc_index + 1} rejected: not a fiscal receipt")
-            return _INVALID_DOC_ERROR
-        
-        if "expenses" in data and isinstance(data["expenses"], list):
-            txs_data = data["expenses"]
-        elif isinstance(data, list):
-            txs_data = data
-        elif isinstance(data, dict):
-            data.pop("valid", None)
-            txs_data = [data]
-        else:
-            print(f"[LLM] Error: Unexpected JSON structure: {raw_text[:150]}")
-            return []
-
-        expenses = []
-        for t_data in txs_data:
-            try:
-                exp = BusinessTripExpense(**t_data)
-
-                # ── Guardrail 1: validate receipt_date against OCR text ──
-                if exp.receipt_date:
-                    if not _validate_receipt_date(exp.receipt_date, text):
-                        print(f"  [Guardrail] receipt_date '{exp.receipt_date}' NOT found in OCR text — setting to ''")
-                        exp.receipt_date = ""
-
-                # ── Guardrail 2: post-fix extract receipt_date from OCR if LLM missed it ──
-                if not exp.receipt_date:
-                    date_pattern = re.compile(r"\b(\d{2}[./]\d{2}[./]\d{4})\b")
-                    all_dates = date_pattern.findall(text)
-                    if all_dates:
-
-                        exp.receipt_date = all_dates[-1]
-                        print(f"  [Guardrail] Extracted receipt_date from OCR: {exp.receipt_date}")
-
-                # Format city and country in Title Case (e.g. SIBIU -> Sibiu)
-                if exp.vendor_city:
-                    exp.vendor_city = exp.vendor_city.strip().title()
-                if exp.vendor_country:
-                    exp.vendor_country = exp.vendor_country.strip().title()
-
-                # Ensure check_in_date and check_out_date are only kept for accommodation
-                if exp.expense_category != "accommodation":
-                    exp.check_in_date = ""
-                    exp.check_out_date = ""
-
-                expenses.append(exp)
-            except Exception as val_e:
-                print(f"[LLM] Validation error for an expense: {val_e}")
-
-        if expenses:
-            print(f"[LLM] Extracted {len(expenses)} expenses from document {doc_index + 1}")
-            for exp in expenses:
-                print(f"  → {exp.expense_description} | {exp.expense_amount} {exp.currency} | "
-                      f"cat={exp.expense_category} | city={exp.vendor_city} | date={exp.receipt_date} | "
-                      f"check_in={exp.check_in_date} | check_out={exp.check_out_date}")
-            return expenses
-        else:
-            print(f"[LLM] No valid expenses found in document {doc_index + 1}")
-            return []
-
-    except Exception as e:
-        print(f"[LLM] Error extracting expenses: {e}")
+        data = LLMExtraction.model_validate_json(response.content)
+    except ValidationError as e:
+        logger.warning("LLM page %d: invalid JSON output: %s", doc_index + 1, e)
         return []
 
+    if not data.valid:
+        logger.info("LLM page %d rejected: not a fiscal receipt", doc_index + 1)
+        return INVALID_DOC_ERROR
 
-# ─── LangGraph Node: process_document ────────────────────────────────────────
+    exp = BusinessTripExpense(**data.model_dump(exclude={"valid"}))
 
-def process_document(state: DocumentInput) -> dict:
-    """Process a single document: Preprocess → OCR → Hybrid LLM extraction.
-    
-    Called by LangGraph via Send() for each document in parallel.
-    """
-    doc_b64 = state["doc_b64"]
-    doc_index = state["doc_index"]
-    total_docs = state["total_docs"]
+    # ── Guardrail 1: validate receipt_date against OCR text ──
+    if exp.receipt_date and not _validate_receipt_date(exp.receipt_date, text):
+        logger.info("Guardrail: receipt_date '%s' NOT found in OCR text — clearing", exp.receipt_date)
+        exp.receipt_date = ""
 
-    # Step 1: OCR (includes preprocessing pipeline internally)
-    extracted_text = run_ocr_single(doc_b64, doc_index, total_docs)
-    print(f"\n{'='*60}\n[OCR-FULL-TEXT] doc_index={doc_index+1}/{total_docs}\n{extracted_text}\n{'='*60}\n")
+    # ── Guardrail 2: post-fix extract receipt_date from OCR if LLM missed it ──
+    if not exp.receipt_date:
+        all_dates = re.findall(r"\b(\d{2}[./]\d{2}[./]\d{4})\b", text)
+        if all_dates:
+            exp.receipt_date = all_dates[-1]
+            logger.info("Guardrail: extracted receipt_date from OCR: %s", exp.receipt_date)
 
-    # Step 2: Hybrid extraction (OCR text + original image → LLM)
-    result = _run_extraction_hybrid(extracted_text, doc_b64, doc_index)
+    # Format city and country in Title Case (e.g. SIBIU -> Sibiu)
+    exp.vendor_city = exp.vendor_city.strip().title()
+    exp.vendor_country = exp.vendor_country.strip().title()
 
-    # If the AI rejected the document, pass the error marker through
-    if result == _INVALID_DOC_ERROR:
-        return {
-            "extracted_texts": [extracted_text],
-            "extracted_expenses": [_INVALID_DOC_ERROR],
-        }
+    # Ensure check_in_date and check_out_date are only kept for accommodation
+    if exp.expense_category != "accommodation":
+        exp.check_in_date = ""
+        exp.check_out_date = ""
 
-    print(f"expenses: {result}")
-
-    return {
-        "extracted_texts": [extracted_text],
-        "extracted_expenses": result,
-    }
-
-
-# ─── LangGraph Node: generate_report ─────────────────────────────────────────
-
-def generate_report(state: FinancialState) -> dict:
-    """Format expenses into report dict."""
-    report = "### Business Trip Expenses Extracted Successfully."
-    return {"report": report}
+    logger.info("LLM page %d: %s | %s %s | cat=%s | city=%s | date=%s",
+                doc_index + 1, exp.expense_description, exp.expense_amount, exp.currency,
+                exp.expense_category, exp.vendor_city, exp.receipt_date)
+    return [exp]
 
 
 # ─── Utility: deduce transport type ──────────────────────────────────────────
@@ -299,17 +219,15 @@ def _deduce_means_of_transport(description: str) -> str:
     return "Other"
 
 
-# ─── LangGraph Node: aggregate_web_expenses ──────────────────────────────────
+# ─── Web flow: aggregate_web_expenses ──────────────────────────────────
 
-def aggregate_web_expenses(state: FinancialState) -> dict:
+def aggregate_web_expenses(expenses: list) -> dict:
     """Aggregate all extracted expenses into web form structure.
 
     Categorizes each expense into transport/accommodation/other,
     sums up the totals per category, deduces the trip location from
     vendor addresses, and builds the accommodation and transport tables.
     """
-    expenses = state.get("extracted_expenses", [])
-
     transport_total = 0.0
     accommodation_total = 0.0
     other_total = 0.0
@@ -321,7 +239,7 @@ def aggregate_web_expenses(state: FinancialState) -> dict:
     transport_list = []
 
     for exp in expenses:
-        if exp == "__INVALID_DOCUMENT__":
+        if exp == INVALID_DOC_ERROR:
             continue
 
         currency = exp.currency
@@ -380,7 +298,7 @@ def aggregate_web_expenses(state: FinancialState) -> dict:
     # Deduce the trip location prioritizing accommodation city
     location = ""
     for exp in expenses:
-        if exp == "__INVALID_DOCUMENT__":
+        if exp == INVALID_DOC_ERROR:
             continue
         if getattr(exp, "expense_category", "other") == "accommodation" and getattr(exp, "vendor_city", ""):
             location = exp.vendor_city
@@ -404,7 +322,7 @@ def aggregate_web_expenses(state: FinancialState) -> dict:
     acc_check_ins = []
     acc_check_outs = []
     for exp in expenses:
-        if exp == "__INVALID_DOCUMENT__":
+        if exp == INVALID_DOC_ERROR:
             continue
         if getattr(exp, "expense_category", "other") == "accommodation":
             ci = getattr(exp, "check_in_date", "")
@@ -440,7 +358,7 @@ def aggregate_web_expenses(state: FinancialState) -> dict:
     if not start_date or not end_date:
         all_receipt_dates = []
         for exp in expenses:
-            if exp == "__INVALID_DOCUMENT__":
+            if exp == INVALID_DOC_ERROR:
                 continue
             rd = _parse_flexible_date(exp.receipt_date)
             if rd:

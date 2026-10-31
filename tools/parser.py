@@ -28,6 +28,16 @@ def image_to_base64(image: Image.Image, fmt: str = "JPEG") -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
+def downscale_base64(img_b64: str, max_side: int) -> str:
+    """Return the image re-encoded with its longest side at most max_side pixels."""
+    image = Image.open(io.BytesIO(base64.b64decode(img_b64)))
+    if max(image.size) <= max_side:
+        return img_b64
+    ratio = max_side / max(image.size)
+    image = image.resize((int(image.width * ratio), int(image.height * ratio)), Image.LANCZOS)
+    return image_to_base64(image)
+
+
 def parse_pdf_to_images(file_bytes: bytes) -> list[str]:
     """Convert each page of a PDF to a base64-encoded image."""
     pdf = pdfium.PdfDocument(file_bytes)

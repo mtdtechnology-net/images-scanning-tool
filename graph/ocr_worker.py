@@ -1,45 +1,54 @@
-"""OCR worker module — thread-safe with per-thread PaddleOCR instances.
+"""OCR worker module — one PaddleOCR instance on one dedicated thread.
 
-Each thread gets its own PaddleOCR instance via threading.local() to avoid
-C++ buffer corruption when LangGraph runs multiple document processing
-nodes concurrently.
+PaddleOCR's C++ internals crash if an instance is used from a different thread
+than the one that created it, and a second instance would only duplicate the
+model in (GPU) memory. So all OCR calls go through a single-thread executor,
+serialized by an asyncio lock. Image preprocessing (CPU) runs outside that
+thread so it overlaps with OCR of other pages.
 
 Includes:
 - Image preprocessing pipeline (auto-crop, enhance, etc.)
 - OCR text reconstruction with row merging
 
-Usage from nodes.py:
-    from graph.ocr_worker import run_ocr_single
-    text = run_ocr_single(b64, idx, total)
+Usage:
+    from graph.ocr_worker import run_ocr
+    text = await run_ocr(b64, idx, total)
 """
+import asyncio
 import base64
 import io
+import logging
 import re
-import os
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 import numpy as np
+from core.config import OCR_DEVICE, OCR_LANG
 from graph.preprocess import preprocess_for_ocr
 
+logger = logging.getLogger(__name__)
 
 _DATE_LINE_RE = re.compile(r"^\s*\d{1,4}[./-]\d{1,2}[./-]\d{1,4}")
 
-import threading
+_ocr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr")
+_ocr_lock = asyncio.Lock()
+_ocr_instance = None
 
-_thread_local = threading.local()
-_ocr_init_lock = threading.Lock()
 
 def _get_ocr():
-    """Get or create a PaddleOCR instance for the current thread.
-    
-    PaddleOCR's C++ internals crash if called from a different thread
-    than the one that created the instance. We use threading.local()
-    so each LangGraph worker thread gets its own isolated instance.
-    """
-    if not hasattr(_thread_local, "ocr_instance"):
-        with _ocr_init_lock:
-            from paddleocr import PaddleOCR
-            _thread_local.ocr_instance = PaddleOCR(lang="en", use_angle_cls=False, use_gpu=False)
-    return _thread_local.ocr_instance
+    """Create the PaddleOCR instance lazily; only ever called on the OCR thread."""
+    global _ocr_instance
+    if _ocr_instance is None:
+        from paddleocr import PaddleOCR
+        _ocr_instance = PaddleOCR(
+            lang=OCR_LANG,
+            device=OCR_DEVICE,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+        )
+        logger.info("PaddleOCR loaded (lang=%s, device=%s)", OCR_LANG, OCR_DEVICE)
+    return _ocr_instance
+
 
 def _merge_continuation_lines(lines_text: list[str]) -> list[str]:
     """Merge OCR rows that don't start with a date into the previous row."""
@@ -51,45 +60,33 @@ def _merge_continuation_lines(lines_text: list[str]) -> list[str]:
             merged[-1] = f"{merged[-1]}\n{line}"
     return merged
 
-def _process_single_image(args: tuple) -> tuple[int, str]:
-    img_b64, doc_index, total_docs = args
 
-    img_bytes = base64.b64decode(img_b64)
-    image = Image.open(io.BytesIO(img_bytes))
+def _prepare_image(img_b64: str) -> np.ndarray:
+    """Decode + preprocess an image into the BGR array PaddleOCR expects."""
+    image = Image.open(io.BytesIO(base64.b64decode(img_b64)))
     if image.mode != "RGB":
         image = image.convert("RGB")
-
-    # --- NEW: Preprocessing pipeline (auto-crop, enhance, cap size) ---
     image = preprocess_for_ocr(image)
+    return np.array(image)[:, :, ::-1]
 
-    img_array = np.array(image)
-    img_array = img_array[:, :, ::-1]
 
-    ocr_instance = _get_ocr()
-    result = ocr_instance.ocr(img_array)
-    
-    print(f"[DEBUG-OCR] Raw result length: {len(result) if result else 'None'}")
-    if result and result[0]:
-        print(f"[DEBUG-OCR] First page items count: {len(result[0])}")
+def _ocr_items(img_array: np.ndarray) -> list[tuple[float, float, str]]:
+    """Run OCR and return (y_center, x_center, text) for every detected line."""
+    result = _get_ocr().predict(img_array)
+    if not result:
+        return []
 
+    res = result[0]
     items = []
+    for text, poly in zip(res["rec_texts"], res["rec_polys"]):
+        xs = [pt[0] for pt in poly]
+        ys = [pt[1] for pt in poly]
+        items.append((sum(ys) / len(ys), sum(xs) / len(xs), text))
+    return items
 
-    if result and result[0]:
-        res = result[0]
 
-        if isinstance(res, dict):
-            texts = res.get("rec_texts", [])
-            polys = res.get("rec_polys") or res.get("dt_polys") or []
-            for text, poly in zip(texts, polys):
-                xs = [pt[0] for pt in poly]
-                ys = [pt[1] for pt in poly]
-                items.append((sum(ys) / len(ys), sum(xs) / len(xs), text))
-        else:
-            for box, (text, conf) in res:
-                y_center = sum(pt[1] for pt in box) / 4.0
-                x_center = sum(pt[0] for pt in box) / 4.0
-                items.append((y_center, x_center, text))
-
+def _items_to_text(items: list[tuple[float, float, str]]) -> list[str]:
+    """Group OCR items into visual rows (by y) and join each row left to right."""
     items.sort(key=lambda x: x[0])
     rows = []
     current_row = []
@@ -115,30 +112,28 @@ def _process_single_image(args: tuple) -> tuple[int, str]:
         row.sort(key=lambda item: item[0])
         lines_text.append(" | ".join(item[1] for item in row))
 
-    lines_text = _merge_continuation_lines(lines_text)
+    return _merge_continuation_lines(lines_text)
+
+
+async def run_ocr(img_b64: str, doc_index: int, total_docs: int, on_start=None) -> str:
+    """Preprocess + OCR one page. `on_start` is awaited once the OCR slot is acquired."""
+    loop = asyncio.get_running_loop()
+    img_array = await asyncio.to_thread(_prepare_image, img_b64)
+
+    async with _ocr_lock:
+        if on_start:
+            await on_start()
+        items = await loop.run_in_executor(_ocr_executor, _ocr_items, img_array)
+
+    lines_text = _items_to_text(items)
+    logger.info("OCR page %d/%d — %d rows reconstructed", doc_index + 1, total_docs, len(lines_text))
 
     page_text = "\n".join(lines_text)
-
-    doc_label = f"--- Document {doc_index + 1} / {total_docs} ---"
-    full_text = f"{doc_label}\n{page_text}"
-
-    print(f"[OCR] Processed document {doc_index + 1}/{total_docs}"
-          f" — {len(lines_text)} rows reconstructed")
-
-    return (doc_index, full_text)
+    return f"--- Document {doc_index + 1} / {total_docs} ---\n{page_text}"
 
 
-def run_ocr_single(img_b64: str, doc_index: int, total_docs: int) -> str:
-    """Run OCR on a single image (thread-safe via threading.local)."""
-    _, text = _process_single_image((img_b64, doc_index, total_docs))
-    return text
-
-
-def run_ocr_parallel(tasks: list[tuple[str, int, int]]) -> list[str]:
-    """Run OCR on multiple images sequentially (each in its own thread-local context)."""
-    results = {}
-    for task in tasks:
-        doc_index, text = _process_single_image(task)
-        results[doc_index] = text
-
-    return [results[i] for i in sorted(results.keys())]
+async def warmup_ocr() -> None:
+    """Load the OCR model (and GPU kernels) at startup instead of on the first request."""
+    loop = asyncio.get_running_loop()
+    blank = np.full((64, 256, 3), 255, dtype=np.uint8)
+    await loop.run_in_executor(_ocr_executor, _ocr_items, blank)

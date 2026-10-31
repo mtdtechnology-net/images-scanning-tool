@@ -6,18 +6,29 @@ dependencies = [
     "fastapi>=0.115.0",
     "langchain-core>=0.3.0",
     "langchain-ollama>=0.2.0",
-    "langgraph>=0.2.0",
     "numpy>=1.24.0",
     "opencv-contrib-python>=4.10.0.84",
-    "paddleocr>=2.7.0",
-    "paddlepaddle-gpu>=2.6.0",
+    "paddleocr>=3.7.0,<3.8",
+    # Local dev (macOS) runs OCR on CPU; the Linux server runs it on the RTX 5060 Ti
+    # (Blackwell / sm_120), which needs the CUDA 12.9 build from Paddle's own index.
+    "paddlepaddle==3.3.1; sys_platform == 'darwin'",
+    "paddlepaddle-gpu==3.3.1; sys_platform == 'linux'",
     "pillow>=10.0.0",
     "pydantic>=2.0.0",
     "pypdfium2>=4.0.0",
     "python-dateutil>=2.9.0.post0",
-    "python-jose>=3.5.0",
     "python-multipart>=0.0.9",
-    "requests>=2.34.2",
     "setuptools",
     "uvicorn[standard]>=0.30.0",
 ]
+
+[tool.uv]
+environments = ["sys_platform == 'darwin'", "sys_platform == 'linux'"]
+
+[[tool.uv.index]]
+name = "paddle-cu129"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu129/"
+explicit = true
+
+[tool.uv.sources]
+paddlepaddle-gpu = { index = "paddle-cu129", marker = "sys_platform == 'linux'" }

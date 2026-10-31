@@ -1,11 +1,4 @@
-from typing import TypedDict, Optional, Literal, Annotated
-import operator
-from pydantic import BaseModel, Field
-
-CategoryType = Literal[
-    "Income", "Rent", "Utilities", "Salaries", "Food",
-    "Transport", "Subscriptions", "Taxes", "Transfer", "Fee", "Other"
-]
+from pydantic import BaseModel
 
 
 class BusinessTripExpense(BaseModel):
@@ -21,29 +14,20 @@ class BusinessTripExpense(BaseModel):
     check_in_date: str = ""          # check-in / arrival date (for accommodation)
     check_out_date: str = ""         # check-out / departure date (for accommodation)
 
-class ExtractionResult(BaseModel):
-    expenses: list[BusinessTripExpense]
 
-
-class DocumentInput(TypedDict):
-    """Input for a single parallel document processing branch.
-    Each Send() creates one of these."""
-    doc_b64: str
-    doc_index: int
-    total_docs: int
-    company_cif: Optional[str]
-    company_name: Optional[str]
-
-
-class FinancialState(TypedDict):
-    documents: list[str]
-    source: str  # "mobile" | "web"
-
-    extracted_texts: Annotated[list[str], operator.add]
-    extracted_expenses: Annotated[list, operator.add]
-    current_doc_index: int
-    report: str
-    web_result: dict  # populated only for web flow
-
-    company_cif: Optional[str]
-    company_name: Optional[str]
+class LLMExtraction(BaseModel):
+    """Exact shape the LLM must return. Its JSON schema is passed to Ollama as
+    `format`, so decoding is constrained to valid JSON with every field present.
+    `valid` comes first so the model decides it before filling the fields."""
+    valid: bool
+    expense_description: str
+    invoice_number_date: str
+    receipt_date: str
+    expense_amount: float
+    currency: str
+    expense_category: str
+    vendor_city: str
+    vendor_country: str
+    number_of_nights: int
+    check_in_date: str
+    check_out_date: str

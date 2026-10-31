@@ -8,10 +8,13 @@ Applies a pipeline of transformations to improve OCR accuracy:
 4. Sharpening: Crisps up edges of characters
 5. Size cap: Ensures output doesn't exceed PaddleOCR's max_side_limit
 """
+import logging
 import cv2
 import numpy as np
 from PIL import Image, ImageEnhance
 
+
+logger = logging.getLogger(__name__)
 
 MIN_OCR_WIDTH = 1800
 MAX_OCR_SIDE = 3900
@@ -82,7 +85,7 @@ def _auto_crop_receipt(image: Image.Image) -> Image.Image:
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
-        print("[PREPROCESS] No contours found, skipping crop")
+        logger.debug("No contours found, skipping crop")
         return image
 
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
@@ -99,7 +102,7 @@ def _auto_crop_receipt(image: Image.Image) -> Image.Image:
         if len(approx) == 4:
             warped = _perspective_crop(img_array, approx)
             wh, ww = warped.shape[:2]
-            print(f"[PREPROCESS] Perspective crop: {w}x{h} -> {ww}x{wh}")
+            logger.debug(f"Perspective crop: {w}x{h} -> {ww}x{wh}")
             return Image.fromarray(warped)
 
     # Fallback: bounding rect of the largest valid contour
@@ -116,10 +119,10 @@ def _auto_crop_receipt(image: Image.Image) -> Image.Image:
         y2 = min(h, y + ch + 2 * margin)
 
         cropped = image.crop((x, y, x2, y2))
-        print(f"[PREPROCESS] Bounding box crop: {w}x{h} -> {x2 - x}x{y2 - y}")
+        logger.debug(f"Bounding box crop: {w}x{h} -> {x2 - x}x{y2 - y}")
         return cropped
 
-    print("[PREPROCESS] No suitable document contour found, skipping crop")
+    logger.debug("No suitable document contour found, skipping crop")
     return image
 
 
@@ -135,7 +138,7 @@ def _upscale_if_small(image: Image.Image) -> Image.Image:
     new_h = int(h * scale)
 
     upscaled = image.resize((new_w, new_h), Image.LANCZOS)
-    print(f"[PREPROCESS] Upscaled: {w}x{h} -> {new_w}x{new_h} ({scale:.1f}x)")
+    logger.debug(f"Upscaled: {w}x{h} -> {new_w}x{new_h} ({scale:.1f}x)")
 
     return upscaled
 
@@ -148,7 +151,7 @@ def _enhance_for_ocr(image: Image.Image) -> Image.Image:
     enhancer = ImageEnhance.Sharpness(image)
     image = enhancer.enhance(2.0)
 
-    print("[PREPROCESS] Enhanced: contrast=1.5, sharpness=2.0")
+    logger.debug("Enhanced: contrast=1.5, sharpness=2.0")
     return image
 
 
@@ -164,7 +167,7 @@ def _cap_size(image: Image.Image) -> Image.Image:
     new_w = int(w * ratio)
     new_h = int(h * ratio)
     image = image.resize((new_w, new_h), Image.LANCZOS)
-    print(f"[PREPROCESS] Downscaled to fit PaddleOCR limits: {w}x{h} -> {new_w}x{new_h}")
+    logger.debug(f"Downscaled to fit PaddleOCR limits: {w}x{h} -> {new_w}x{new_h}")
 
     return image
 
@@ -178,12 +181,12 @@ def preprocess_for_ocr(image: Image.Image) -> Image.Image:
     3. Enhance contrast and sharpness
     4. Cap size to PaddleOCR's limits
     """
-    print(f"[PREPROCESS] Input image: {image.size[0]}x{image.size[1]}")
+    logger.debug(f"Input image: {image.size[0]}x{image.size[1]}")
 
     image = _auto_crop_receipt(image)
     image = _upscale_if_small(image)
     image = _enhance_for_ocr(image)
     image = _cap_size(image)
 
-    print(f"[PREPROCESS] Output image: {image.size[0]}x{image.size[1]}")
+    logger.debug(f"Output image: {image.size[0]}x{image.size[1]}")
     return image
