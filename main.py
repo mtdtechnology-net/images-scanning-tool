@@ -248,6 +248,7 @@ async def generate_financial_report_stream(
                     "invoice_number_date": invoice_str,
                     "expense_amount": exp.expense_amount,
                     "currency": exp.currency,
+                    "expense_category": exp.expense_category,
                 }
 
             yield _sse_event("done", "Extraction complete!", {

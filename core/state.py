@@ -7,7 +7,7 @@ class BusinessTripExpense(BaseModel):
     receipt_date: str = ""
     expense_amount: float
     currency: str
-    expense_category: str = "other"  # "transport" | "accommodation" | "other"
+    expense_category: str = "other"  # "transport" | "accommodation" | "course" | "other"
     vendor_city: str = ""            # city extracted from vendor address
     vendor_country: str = ""         # country extracted from vendor address
     number_of_nights: int = 0        # only for accommodation invoices

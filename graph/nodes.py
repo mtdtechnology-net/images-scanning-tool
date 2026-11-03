@@ -26,6 +26,18 @@ llm = ChatOllama(
 
 INVALID_DOC_ERROR = "__INVALID_DOCUMENT__"
 
+EXPENSE_CATEGORIES = ("transport", "accommodation", "course", "other")
+
+
+def _normalize_category(category: str) -> str:
+    """Map the LLM's category string onto one of EXPENSE_CATEGORIES ("other" as fallback)."""
+    c = (category or "").strip().lower()
+    if c in EXPENSE_CATEGORIES:
+        return c
+    if c in ("courses", "training", "education", "conference", "seminar", "workshop"):
+        return "course"
+    return "other"
+
 
 _DATE_PATTERNS = [
     r'\d{1,2}[.]\d{1,2}[.]\d{2,4}',            # 08.07.2026
@@ -156,6 +168,7 @@ async def run_extraction_hybrid(text: str, image_b64: str, doc_index: int) -> li
         return INVALID_DOC_ERROR
 
     exp = BusinessTripExpense(**data.model_dump(exclude={"valid"}))
+    exp.expense_category = _normalize_category(exp.expense_category)
 
     # ── Guardrail 1: validate receipt_date against OCR text ──
     if exp.receipt_date and not _validate_receipt_date(exp.receipt_date, text):
@@ -173,10 +186,11 @@ async def run_extraction_hybrid(text: str, image_b64: str, doc_index: int) -> li
     exp.vendor_city = exp.vendor_city.strip().title()
     exp.vendor_country = exp.vendor_country.strip().title()
 
-    # Ensure check_in_date and check_out_date are only kept for accommodation
+    # Ensure check_in_date, check_out_date and nights are only kept for accommodation
     if exp.expense_category != "accommodation":
         exp.check_in_date = ""
         exp.check_out_date = ""
+        exp.number_of_nights = 0
 
     logger.info("LLM page %d: %s | %s %s | cat=%s | city=%s | date=%s",
                 doc_index + 1, exp.expense_description, exp.expense_amount, exp.currency,
@@ -224,12 +238,14 @@ def _deduce_means_of_transport(description: str) -> str:
 def aggregate_web_expenses(expenses: list) -> dict:
     """Aggregate all extracted expenses into web form structure.
 
-    Categorizes each expense into transport/accommodation/other,
+    Categorizes each expense into transport/accommodation/course/other,
     sums up the totals per category, deduces the trip location from
-    vendor addresses, and builds the accommodation and transport tables.
+    vendor addresses, and builds the accommodation, transport, course
+    and other-expenses tables.
     """
     transport_total = 0.0
     accommodation_total = 0.0
+    course_total = 0.0
     other_total = 0.0
     currency = "RON"
     items = []
@@ -237,6 +253,8 @@ def aggregate_web_expenses(expenses: list) -> dict:
     countries = []
     accommodation_list = []
     transport_list = []
+    course_list = []
+    other_list = []
 
     for exp in expenses:
         if exp == INVALID_DOC_ERROR:
@@ -244,12 +262,14 @@ def aggregate_web_expenses(expenses: list) -> dict:
 
         currency = exp.currency
         amount = exp.expense_amount
-        category = getattr(exp, "expense_category", "other")
+        category = _normalize_category(getattr(exp, "expense_category", "other"))
 
         if category == "transport":
             transport_total += amount
         elif category == "accommodation":
             accommodation_total += amount
+        elif category == "course":
+            course_total += amount
         else:
             other_total += amount
 
@@ -281,6 +301,21 @@ def aggregate_web_expenses(expenses: list) -> dict:
                 "city": vendor_city,
                 "meansOfTransport": _deduce_means_of_transport(exp.expense_description),
             })
+
+        # Build course / other expense entries (mirror the web form fields:
+        # expense title, bill ID, amount, currency)
+        if category in ("course", "other"):
+            bill_id = exp.invoice_number_date
+            if exp.receipt_date and exp.receipt_date not in bill_id:
+                bill_id = f"{bill_id} / {exp.receipt_date}" if bill_id else exp.receipt_date
+            entry = {
+                "expenseTitle": exp.expense_description,
+                "billId": bill_id,
+                "amount": exp.expense_amount,
+                "currency": exp.currency,
+                "receiptDate": exp.receipt_date,
+            }
+            (course_list if category == "course" else other_list).append(entry)
 
         items.append({
             "expense_description": exp.expense_description,
@@ -384,14 +419,19 @@ def aggregate_web_expenses(expenses: list) -> dict:
             "endDate": end_date,
             "transportCost": round(transport_total, 2),
             "accommodationCost": round(accommodation_total, 2),
+            "courseCost": round(course_total, 2),
             "otherCosts": round(other_total, 2),
             "perDiemCost": round(per_diem_cost, 2),
             "currency": currency,
-            "estimatedTotalCost": round(transport_total + accommodation_total + other_total + per_diem_cost, 2),
+            "estimatedTotalCost": round(
+                transport_total + accommodation_total + course_total + other_total + per_diem_cost, 2
+            ),
             "location": location,
             "country": country,
             "accommodation": accommodation_list,
             "transport": transport_list,
+            "courseExpenses": course_list,
+            "otherExpenses": other_list,
             "items": items,
         }
     }

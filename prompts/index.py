@@ -16,6 +16,8 @@ CRITICAL INSTRUCTIONS:
    - expense_description: A short description based on the vendor or main item.
      * For gas stations: use the brand name (e.g. "Gasoline - OMV", "Diesel - Rompetrol").
      * For hotels: use the hotel/property name.
+     * For courses/trainings/conferences: use the course or event name (e.g. "AWS Solutions Architect Training").
+     * For other expenses: use the vendor and main item (e.g. "Restaurant - Casa Veche").
      * Autocorrect common OCR typos in merchant names: "0MV" → "OMV", "PETR0M" → "PETROM".
 
    - invoice_number_date: The real receipt number AND the real transaction date, combined.
@@ -28,10 +30,18 @@ CRITICAL INSTRUCTIONS:
 
    - currency: The currency code. Look for "LEI", "RON", "€", "EUR", "USD", "$".
 
-   - expense_category: Classify the expense into ONE of these:
-     * "transport" — fuel, gas, diesel, parking, taxi, toll, uber, train ticket, bus ticket, plane ticket
-     * "accommodation" — hotel, hostel, airbnb, motel, lodging, room rental
-     * "other" — anything that is neither transport nor accommodation
+   - expense_category: Classify the expense into EXACTLY ONE of these four values:
+     * "transport" — fuel, gas, diesel, parking, taxi, toll, uber, bolt, car rental, train ticket, bus ticket, plane ticket
+     * "accommodation" — hotel, hostel, airbnb, motel, guesthouse, lodging, room rental
+     * "course" — training/education costs: course or training fee, workshop, seminar, conference or
+       summit registration, certification or exam fee, e-learning subscription, bootcamp, tuition,
+       course materials or books bought for a training (e.g. "Curs", "Instruire", "Training",
+       "Taxa de participare", "Inscriere conferinta", "Certificare", "Examen")
+     * "other" — every remaining business expense that is NOT transport, accommodation or course:
+       meals, restaurant, food, groceries, coffee, office supplies, phone/SIM/roaming, visa fees,
+       medical/travel insurance, laundry, printing, souvenirs, any other purchase
+     * When in doubt between "course" and "other", choose "course" only if the document clearly
+       refers to a training/educational/conference event; otherwise choose "other".
 
    - vendor_city: The city where the physical service was provided, written in Title Case (e.g. "Sibiu", "Cluj-Napoca", NOT all caps).
      * CRITICAL for gas stations: Look for the actual station location (e.g. "Sibiu", "Cluj"), DO NOT extract the corporate headquarters (which is often "Bucuresti").
