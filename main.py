@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, List
+from typing import AsyncIterator, Callable, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -113,8 +113,11 @@ class PageError(Exception):
     pass
 
 
-async def _parse_uploads(uploads, filenames: list[str], images: list[str]) -> AsyncIterator[str]:
-    """Convert uploads to page images, filling `filenames` and `images`."""
+async def _parse_uploads(
+    uploads, filenames: list[str], images: list[str], page_files: list[int] | None = None
+) -> AsyncIterator[str]:
+    """Convert uploads to page images, filling `filenames` and `images`.
+    `page_files[i]` (if given) is the index in `filenames` of the file page i came from."""
     yield _sse_event("parsing", "Converting documents to images...")
 
     for filename, content_type, file_bytes in uploads:
@@ -123,6 +126,8 @@ async def _parse_uploads(uploads, filenames: list[str], images: list[str]) -> As
         except Exception as e:
             raise PageError(f"Failed to process '{filename}': {e}")
         images.extend(pages)
+        if page_files is not None:
+            page_files.extend([len(filenames)] * len(pages))
         filenames.append(filename)
 
     if not images:
@@ -133,12 +138,18 @@ async def _parse_uploads(uploads, filenames: list[str], images: list[str]) -> As
     yield _sse_event("parsed", f"Found {len(images)} pages to process.", {"total_docs": len(images)})
 
 
-async def _process_pages(images: list[str], results: list) -> AsyncIterator[str]:
+async def _process_pages(
+    images: list[str],
+    results: list,
+    on_page_done: Callable[[int, object], str | None] | None = None,
+) -> AsyncIterator[str]:
     """OCR + LLM extraction for all pages, pipelined: while one page is in the LLM,
     the next one is already in OCR. OCR is serialized (one model instance) and LLM
     calls are capped by LLM_CONCURRENCY across all requests.
 
     Yields SSE progress events; fills `results[i]` with the extraction for page i.
+    If `on_page_done(i, result)` returns an event, it is yielded as soon as page i
+    is extracted, so the client can show each page's data without waiting for the rest.
     """
     total = len(images)
     results.extend([None] * total)
@@ -164,6 +175,10 @@ async def _process_pages(images: list[str], results: list) -> AsyncIterator[str]
                 results[i] = await run_extraction_hybrid(text, llm_image, i)
             except Exception as e:
                 raise PageError(f"AI extraction failed on page {i+1}: {e}") from e
+        if on_page_done:
+            event = on_page_done(i, results[i])
+            if event:
+                await events.put(event)
 
     async def run(i: int, img_b64: str) -> None:
         try:
@@ -278,11 +293,27 @@ async def generate_web_report_stream(
     async def event_generator():
         filenames: list[str] = []
         images: list[str] = []
+        page_files: list[int] = []
         results: list = []
+
+        def page_item_event(i: int, result) -> str:
+            """Send each page's expenses as soon as they are extracted. The final
+            `done` event still carries all items, for clients that ignore `item`."""
+            items = aggregate_web_expenses(_flatten([result]))["web_result"].get("items", [])
+            file_index = page_files[i]
+            return _sse_event("item", f"Page {i+1}/{len(images)} extracted.", {
+                "page": i + 1,
+                "total": len(images),
+                "file_index": file_index,
+                "file": filenames[file_index],
+                "valid": result != INVALID_DOC_ERROR,
+                "items": items,
+            })
+
         try:
-            async for event in _parse_uploads(uploads, filenames, images):
+            async for event in _parse_uploads(uploads, filenames, images, page_files):
                 yield event
-            async for event in _process_pages(images, results):
+            async for event in _process_pages(images, results, page_item_event):
                 yield event
 
             yield _sse_event("aggregating", "Aggregating extracted expenses...")
