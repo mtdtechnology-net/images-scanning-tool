@@ -215,35 +215,52 @@ Check the exact tags in the Ollama library before pulling. Qwen VL models above 
 
 ### VRAM budget (16 GB RTX 5060 Ti)
 
-| Resident during | Estimate | Measured |
-|---|---|---|
-| PaddleOCR (service process, `auto_growth` keeps what it took) | 1–2 GB | _to fill in_ |
-| Live scan: `qwen3-vl:8b-instruct` Q4, `num_ctx` 8192 × `OLLAMA_NUM_PARALLEL=2` | 9–10 GB | _to fill in_ |
-| Verifier: `qwen3-vl:8b` Q8, `num_ctx` 8192 × 2 | ~11–13 GB | _to fill in_ |
-| Verifier: `qwen2.5vl:7b` Q8, `num_ctx` 8192 × 2 | ~10–12 GB | _to fill in_ |
+Measured on 2026-11-07, idle, with the service warm (`nvidia-smi`, `ollama ps`):
 
-Live-scan model and Q8 verifier together don't fit, so the default is swap mode. Fill in the
-"Measured" column from `nvidia-smi` / `ollama ps` and the benchmark's peak VRAM. If a Q8 verifier
-doesn't reach 100% GPU next to PaddleOCR, lower `VERIFY_NUM_CTX` or use the Q4 tags.
+| Resident | Measured | Note |
+|---|---|---|
+| PaddleOCR (service process) | **4,944 MiB** | `auto_growth` keeps the peak it reached; far above the 1–2 GB first assumed |
+| Live scan: `qwen3-vl:8b-instruct` (Q4), context 8192, `OLLAMA_NUM_PARALLEL=2` | **7,012 MiB** (`ollama ps`: 7.5 GB, 100% GPU) | |
+| Total used / available | **11,970 / 16,311 MiB** | ~4.3 GB free |
+| Verifier, swap mode (scanner unloaded, PaddleOCR stays) | ~11 GB available | `qwen3-vl:8b` Q8 needs roughly 11–12 GB with context, so it is borderline; Q4 (~7.5 GB) fits |
+
+Conclusions:
+- **Resident mode is out:** the scanner, PaddleOCR and any ~7B verifier don't fit together (7.0 + 4.9 + 7+ GB > 16 GB). Swap mode it is.
+- **Q8 verifier models may not reach 100% GPU** next to PaddleOCR's 4.9 GB. The verifier checks `/api/ps` and refuses with a clear `error` if not. Fallback: the Q4 tags (`qwen3-vl:8b-thinking`, `qwen2.5vl:7b`), or a lower `VERIFY_NUM_CTX`.
+- Still to measure: the peak during a live scan, and the verifier peak (the benchmark reports it).
 
 ### Recommended Ollama settings
-- Keep `OLLAMA_KEEP_ALIVE=-1` for the live-scan model. The verifier passes its own `keep_alive` per call and unloads its models explicitly.
-- `OLLAMA_MAX_LOADED_MODELS`: the default is fine in swap mode, because only one model is loaded at a time. Set it to `2` only for `VERIFY_GPU_MODE=resident`.
-- `OLLAMA_NUM_PARALLEL` applies to every model, so the verifier's KV cache is also allocated ×2. If VRAM is tight, lower `VERIFY_NUM_CTX` rather than `OLLAMA_NUM_PARALLEL`, because live scans need the parallelism.
+Current `ollama.service` environment: `OLLAMA_HOST=0.0.0.0:11434 OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_NUM_PARALLEL=2 OLLAMA_CONTEXT_LENGTH=8192`.
+
+- **`OLLAMA_HOST=0.0.0.0` exposes Ollama to the whole network without authentication.** Anyone on the LAN can run, pull or delete models. The scanning service talks to it via `localhost`. Unless another machine needs Ollama directly, bind it to `127.0.0.1:11434`.
+- `OLLAMA_KEEP_ALIVE` is not set on the server. That's fine: the service sends `keep_alive=-1` per request (`ollama ps` shows `Forever`), and the verifier passes its own value and unloads its models explicitly.
+- `OLLAMA_MAX_LOADED_MODELS`: the default is fine in swap mode, because only one model is loaded at a time.
+- `OLLAMA_NUM_PARALLEL=2` applies to every model, so the verifier's KV cache is also allocated ×2. If VRAM is tight, lower `VERIFY_NUM_CTX` rather than `OLLAMA_NUM_PARALLEL`, because live scans need the parallelism.
 
 ### CPU: only 1 CPU visible
-_To fill in from the hardware investigation (`nproc`, `lscpu`, `cpu.max`, `cpuset.cpus.effective`,
-`systemctl show scanning-tool.service -p CPUQuota -p AllowedCPUs -p CPUAffinity`, `systemd-detect-virt`, `/proc/cmdline`)._
 
-`CPUQuota` (`cpu.max`) throttles a service but doesn't change `nproc`. A single visible CPU comes
-from one of these:
-- a cpuset or affinity setting (`AllowedCPUs=`, `CPUAffinity=`);
-- a VM with 1 vCPU;
-- a kernel `maxcpus=` or `nr_cpus=` option.
+Measured on 2026-11-07:
 
-Recommendation: give the service and Ollama at least 4–8 of the 12 cores by removing that
-limit. PDF rendering, OCR preprocessing (OpenCV), uvicorn and Ollama's image preprocessing all
-compete for that one CPU today. A person decides; nothing is changed by this repo.
+| Check | Result |
+|---|---|
+| `nproc`, `lscpu` | 1 CPU on-line (`On-line CPU(s) list: 0`), model AMD Ryzen 9 7900 12-Core |
+| VM? | No: `systemd-detect-virt` = none, no hypervisor flag. Bare metal. |
+| cgroup / systemd | No limit: `cpu.max` = `max`, `AllowedCPUs=` and `CPUAffinity=` empty for `scanning-tool` and `ollama` |
+| Kernel command line | **`acpi=off`** |
+
+**Cause: the kernel boot option `acpi=off`.** On modern x86 machines, the extra CPU cores are
+discovered through ACPI tables. With ACPI disabled, Linux brings up only the boot CPU, so 11 of
+the 12 cores (23 of 24 threads) are unused. It isn't a cgroup, systemd or VM limit. `acpi=off`
+also disables ACPI power management and thermal reporting.
+
+Recommendation (a person decides; nothing is changed by this repo):
+1. Find out why `acpi=off` was added. It is usually a workaround for a boot or installation problem.
+2. Test once without it: at the GRUB menu press `e`, remove `acpi=off` from the `linux` line, boot with `Ctrl+X`. Nothing is saved, so the next reboot is back to the current settings. Have console/IPMI access in case it doesn't boot.
+3. If it boots fine and `nproc` shows 24, remove it for good from `GRUB_CMDLINE_LINUX` / `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, then `update-grub` and reboot.
+4. If the original problem returns, try narrower options instead (for example `pci=noacpi` or `acpi=noirq`), which keep CPU discovery working.
+
+With one CPU, PDF rendering, OCR preprocessing (OpenCV), uvicorn, PaddleOCR's host side and
+Ollama's image preprocessing all queue on the same core. Every live scan and verification pays for it.
 
 ### Benchmark
 On the GPU server, with the service running:
