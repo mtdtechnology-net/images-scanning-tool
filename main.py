@@ -5,19 +5,25 @@ os.environ["FLAGS_allocator_strategy"] = "auto_growth"
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from ollama import AsyncClient
 
 from core.config import (
     CORS_ORIGINS, LLM_CONCURRENCY, LLM_IMAGE_MAX_SIDE, MAX_FILE_SIZE, MAX_PAGES,
-    OLLAMA_BASE_URL, OLLAMA_KEEP_ALIVE, OLLAMA_MODEL,
+    OLLAMA_BASE_URL, OLLAMA_KEEP_ALIVE, OLLAMA_MODEL, OLLAMA_NUM_CTX,
+    VERIFY_IDLE_GRACE_S, VERIFY_MODEL, VERIFY_PDF_SCALE, VERIFY_SECOND_MODEL,
+    VERIFY_TOTAL_TIMEOUT, VERIFY_WAIT_IDLE_TIMEOUT,
 )
+from core.gpu_gate import GpuBusy, Preempted, live_scans, verify_semaphore
 from graph.nodes import INVALID_DOC_ERROR, run_extraction_hybrid, aggregate_web_expenses
+from graph.verifier import error_response, verify_pages
+from graph.verifier_ollama import OllamaBackend, VerifierError
 from graph.ocr_worker import run_ocr, warmup_ocr
 from tools.parser import downscale_base64, parse_document_to_images
 
@@ -40,9 +46,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("OCR warm-up failed")
     try:
-        # An empty prompt only loads the model into VRAM.
+        # An empty prompt only loads the model into VRAM. Load it with the same num_ctx as
+        # the extraction calls (graph/nodes.py), or Ollama reloads it on the first scan.
         await AsyncClient(host=OLLAMA_BASE_URL).generate(
-            model=OLLAMA_MODEL, prompt="", keep_alive=OLLAMA_KEEP_ALIVE
+            model=OLLAMA_MODEL, prompt="", keep_alive=OLLAMA_KEEP_ALIVE,
+            options={"num_ctx": OLLAMA_NUM_CTX},
         )
         logger.info("Ollama model %s loaded", OLLAMA_MODEL)
     except Exception:
@@ -114,7 +122,8 @@ class PageError(Exception):
 
 
 async def _parse_uploads(
-    uploads, filenames: list[str], images: list[str], page_files: list[int] | None = None
+    uploads, filenames: list[str], images: list[str], page_files: list[int] | None = None,
+    pdf_scale: float = 1.5,
 ) -> AsyncIterator[str]:
     """Convert uploads to page images, filling `filenames` and `images`.
     `page_files[i]` (if given) is the index in `filenames` of the file page i came from."""
@@ -122,7 +131,7 @@ async def _parse_uploads(
 
     for filename, content_type, file_bytes in uploads:
         try:
-            pages = await asyncio.to_thread(parse_document_to_images, file_bytes, content_type)
+            pages = await asyncio.to_thread(parse_document_to_images, file_bytes, content_type, pdf_scale)
         except Exception as e:
             raise PageError(f"Failed to process '{filename}': {e}")
         images.extend(pages)
@@ -204,6 +213,14 @@ async def _process_pages(
             task.cancel()
 
 
+async def _track_live_scan(events: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Pass the stream through unchanged while marking a live scan as running, so
+    background verifications wait for it (or get preempted)."""
+    async with live_scans.scan():
+        async for event in events:
+            yield event
+
+
 def _flatten(results: list) -> list:
     expenses = []
     for result in results:
@@ -280,7 +297,7 @@ async def generate_financial_report_stream(
             logger.exception("report-stream failed")
             yield _sse_event("error", f"Unexpected error: {str(e)}")
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=SSE_HEADERS)
+    return StreamingResponse(_track_live_scan(event_generator()), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @app.post("/api/web-report-stream")
@@ -335,4 +352,66 @@ async def generate_web_report_stream(
             logger.exception("web-report-stream failed")
             yield _sse_event("error", f"Unexpected error: {str(e)}")
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=SSE_HEADERS)
+    return StreamingResponse(_track_live_scan(event_generator()), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+# ─── Receipt verifier (background, step ④ of the Spendle flow) ───────────────
+
+def _verify_error(notes: str, pages: list[dict] | None = None, duration_ms: int = 0) -> JSONResponse:
+    """Transient failure: the Spendle queue should retry later."""
+    body = error_response(notes, VERIFY_MODEL, VERIFY_SECOND_MODEL, pages)
+    body["duration_ms"] = duration_ms
+    logger.info("verify-receipt: status=error (%s)", notes)
+    return JSONResponse(status_code=503, content=body, headers={"Retry-After": "60"})
+
+
+async def _run_verification(backend: OllamaBackend, images: list[str]):
+    await backend.begin()
+    return await verify_pages(images, backend, VERIFY_MODEL, VERIFY_SECOND_MODEL or None)
+
+
+@app.post("/api/verify-receipt")
+async def verify_receipt(file: UploadFile = File(...)):
+    """Re-read one receipt from its image only (no OCR, no declared values) and report what
+    is printed on it with a measured confidence. Plain JSON, for the Spendle background queue.
+    Status "error" comes with HTTP 503: retry later."""
+    uploads = await _read_uploads([file])
+
+    async with verify_semaphore:
+        try:
+            await live_scans.wait_idle(VERIFY_IDLE_GRACE_S, VERIFY_WAIT_IDLE_TIMEOUT)
+        except GpuBusy:
+            return _verify_error("GPU busy with live scans; retry later.")
+
+        filenames: list[str] = []
+        images: list[str] = []
+        try:
+            async for _ in _parse_uploads(uploads, filenames, images, pdf_scale=VERIFY_PDF_SCALE):
+                pass
+        except PageError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        backend = OllamaBackend()
+        started = time.monotonic()
+        elapsed_ms = lambda: int((time.monotonic() - started) * 1000)  # noqa: E731
+        try:
+            outcome = await asyncio.wait_for(
+                live_scans.run_preemptible(_run_verification(backend, images)), VERIFY_TOTAL_TIMEOUT
+            )
+            duration_ms = elapsed_ms()
+        except Preempted:
+            return _verify_error("Preempted by a live scan; retry later.", duration_ms=elapsed_ms())
+        except asyncio.TimeoutError:
+            return _verify_error(f"Verification took longer than {VERIFY_TOTAL_TIMEOUT}s.", duration_ms=elapsed_ms())
+        except VerifierError as e:
+            return _verify_error(str(e), duration_ms=elapsed_ms())
+        finally:
+            # Unload the verifier and bring the live-scan model back, even if this request is cancelled.
+            await asyncio.shield(backend.end())
+
+    body = outcome.response
+    body["duration_ms"] = duration_ms
+    logger.info("verify-receipt: status=%s pages=%d duration_ms=%d confidence=%s",
+                body["status"], len(body["pages"]), body["duration_ms"],
+                {k: v["confidence"] for k, v in body["fields"].items()})
+    return body

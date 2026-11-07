@@ -16,7 +16,7 @@ def _resize_if_needed(image: Image.Image) -> Image.Image:
     return image.resize(new_size, Image.LANCZOS)
 
 
-def image_to_base64(image: Image.Image, fmt: str = "JPEG") -> str:
+def image_to_base64(image: Image.Image, fmt: str = "JPEG", quality: int = 85) -> str:
     """Convert a PIL Image to a base64 string.
 
     Uses JPEG by default for smaller size (vs PNG).
@@ -24,7 +24,7 @@ def image_to_base64(image: Image.Image, fmt: str = "JPEG") -> str:
     buffer = io.BytesIO()
     if image.mode in ("RGBA", "P"):
         image = image.convert("RGB")
-    image.save(buffer, format=fmt, quality=85)
+    image.save(buffer, format=fmt, quality=quality)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
@@ -38,7 +38,7 @@ def downscale_base64(img_b64: str, max_side: int) -> str:
     return image_to_base64(image)
 
 
-def parse_pdf_to_images(file_bytes: bytes) -> list[str]:
+def parse_pdf_to_images(file_bytes: bytes, scale: float = 1.5) -> list[str]:
     """Convert each page of a PDF to a base64-encoded image."""
     pdf = pdfium.PdfDocument(file_bytes)
     images_b64 = []
@@ -46,7 +46,7 @@ def parse_pdf_to_images(file_bytes: bytes) -> list[str]:
     for page_index in range(len(pdf)):
         page = pdf[page_index]
 
-        bitmap = page.render(scale=1.5)
+        bitmap = page.render(scale=scale)
         pil_image = bitmap.to_pil()
         pil_image = _resize_if_needed(pil_image)
         images_b64.append(image_to_base64(pil_image))
@@ -64,12 +64,13 @@ def parse_image_to_base64(file_bytes: bytes) -> list[str]:
     return [image_to_base64(image)]
 
 
-def parse_document_to_images(file_bytes: bytes, content_type: str) -> list[str]:
+def parse_document_to_images(file_bytes: bytes, content_type: str, pdf_scale: float = 1.5) -> list[str]:
     """Parse a document into a list of base64-encoded images.
 
     Args:
         file_bytes: Raw bytes of the uploaded file
         content_type: MIME type of the file
+        pdf_scale: PDF render scale (pages are still capped at MAX_DIMENSION px)
 
     Returns:
         List of base64-encoded image strings (one per page for PDFs)
@@ -78,7 +79,7 @@ def parse_document_to_images(file_bytes: bytes, content_type: str) -> list[str]:
         ValueError: If the file type is not supported
     """
     if content_type == "application/pdf":
-        return parse_pdf_to_images(file_bytes)
+        return parse_pdf_to_images(file_bytes, pdf_scale)
     elif content_type in ("image/png", "image/jpeg", "image/jpg", "image/webp"):
         return parse_image_to_base64(file_bytes)
     else:

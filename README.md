@@ -14,6 +14,7 @@ upload → PDF/image → page images ─┬─ preprocess (CPU) → PaddleOCR (G
 ```
 
 - **Endpoints:** `POST /api/report-stream` (mobile: first expense) and `POST /api/web-report-stream` (web: aggregated trip). Both return `text/event-stream`.
+- **Verifier:** `POST /api/verify-receipt` re-reads a submitted receipt in the background, image only, and returns plain JSON. See [Receipt verifier](#-receipt-verifier-post-apiverify-receipt).
 - **Pipelining:** pages of a request run concurrently. OCR is serialized on a single PaddleOCR instance; LLM calls are capped by `LLM_CONCURRENCY` across *all* requests. While one page is in the LLM, the next is in OCR.
 - **Warm-up:** on startup the OCR model and the Ollama model are loaded, so the first request isn't slow.
 - **Structured output:** the LLM is constrained to the JSON schema of `LLMExtraction` (`core/state.py`).
@@ -69,6 +70,8 @@ The first start downloads the PaddleOCR models into `~/.paddlex/official_models`
 | `CORS_ORIGINS` | `*` | Comma-separated allowed origins. |
 | `LOG_LEVEL` | `INFO` | `DEBUG` also logs the full OCR text (contains personal data). |
 
+The verifier's `VERIFY_*` variables are listed in [Receipt verifier](#-receipt-verifier-post-apiverify-receipt).
+
 ---
 
 ## 🚀 How to Run Locally (macOS)
@@ -85,3 +88,196 @@ Swagger UI: `http://localhost:8000/docs`
 
 ## 🔍 Health Checks
 - **`GET /api/health`** (Returns `{"status": "ok", ...}`)
+
+---
+
+## 🔎 Receipt verifier (`POST /api/verify-receipt`)
+
+Step ④ of the Spendle flow. After the employee submits a report, the Spendle backend queues
+each receipt and calls this endpoint in the background. It reads the receipt **from the image
+only**: no PaddleOCR, no OCR text, and never the values the employee declared. It reports what
+is printed and how sure it is. The comparison with the declared values (steps ⑤–⑥) happens in
+the Spendle backend with plain rules. The verifier never approves or judges anything.
+
+### Contract
+Request: `multipart/form-data` with one file in field `file` (PDF, PNG, JPEG, WEBP). Same limits
+as the scan endpoints (`MAX_FILE_SIZE_MB`, `MAX_PAGES`).
+
+```json
+{
+  "status": "ok",
+  "model": "qwen3-vl:8b-thinking-q8_0",
+  "models": ["qwen3-vl:8b-thinking-q8_0", "qwen2.5vl:7b-q8_0"],
+  "duration_ms": 18400,
+  "pages": [{ "page": 1, "width": 1240, "height": 1754 }],
+  "fields": {
+    "total_amount":    { "value": 120.0, "raw": "120,00", "confidence": "high", "page": 1, "bbox": [412, 1880, 590, 1932] },
+    "currency":        { "value": "RON", "raw": "LEI", "confidence": "high", "page": 1, "bbox": [600, 1880, 660, 1932] },
+    "receipt_date":    { "value": "2026-11-03", "raw": "03.11.2026", "confidence": "medium", "page": 1, "bbox": null },
+    "document_number": { "value": "F-0042", "raw": "Nr. F-0042", "confidence": "low", "page": 1, "bbox": [100, 360, 300, 400] }
+  },
+  "notes": "document_number: reads disagree (A=F-0042, B=F-0047, C=F-0042, D=F-0047)"
+}
+```
+
+| `status` | Meaning | HTTP |
+|---|---|---|
+| `ok` | Read; check each field's `confidence`. | 200 |
+| `unreadable` | The reads disagree on the total, or no total was found. "I can't tell" is a valid answer. | 200 |
+| `not_a_receipt` | Both models say this is not a receipt or invoice. | 200 |
+| `multiple_receipts` | More than one receipt in the file (by count, or different document numbers on different pages). | 200 |
+| `error` | Temporary: GPU busy, preempted by a live scan, model missing, timeout. **Retry later.** | 503 + `Retry-After` |
+
+An unsupported or corrupt file is a client error: HTTP 400 like the other endpoints. Don't retry it.
+
+- `value` is normalized:
+  - amounts are numbers (`1.234,56` and `1,234.56` become `1234.56`);
+  - currencies are ISO 4217 codes (`LEI`/`lei`/`RON` become `RON`, `€` becomes `EUR`);
+  - dates are `YYYY-MM-DD`, read day-first as on Romanian receipts.
+- `raw` is the text exactly as read.
+- A field that is not on the document is `{"value": null, "raw": null, "confidence": "none", "page": null, "bbox": null}`.
+- `total_amount` is the final amount paid, VAT included. It is never the subtotal, the VAT line, the cash handed over or the change.
+- `bbox` is `[x0, y0, x1, y1]` in pixels of the page image described in `pages`, or `null`. It is never `[]`. To highlight it on a page rendered at another size, scale by `rendered_width / width`.
+- `notes` is a short reason when the status isn't `ok` or a field isn't `high`; otherwise `null`.
+- Expect minutes per receipt, not seconds. Set the caller's HTTP timeout to at least `VERIFY_WAIT_IDLE_TIMEOUT + VERIFY_TOTAL_TIMEOUT` (about 21 minutes with the defaults).
+
+### How it reads
+
+| Read | Model | Input | Asks for |
+|---|---|---|---|
+| A | `VERIFY_MODEL` | every page, longest side `VERIFY_IMAGE_MAX_SIDE` | all four fields, each with a box; document type; receipt count |
+| B | `VERIFY_MODEL` | the total's page at 0.75× that size, other prompt | every amount line with its label (subtotal, VAT, total, cash, change); code picks the final total |
+| C | `VERIFY_MODEL` | a full-width strip around each field A located, enlarged up to 2× | that one value again, at a higher resolution |
+| D | `VERIFY_SECOND_MODEL` (another Qwen generation) | the pages where A found fields | the same as A |
+
+Confidence is measured from agreement, never self-reported:
+
+| Confidence | When |
+|---|---|
+| `high` | every read that ran agrees after normalization, and a model located the value with a box |
+| `medium` | they agree but there is no usable box, a read did not find the value, or they differ only in formatting (`F-0042` vs `F42`) |
+| `low` | they disagree, or only one read found the value. The majority value is returned and `notes` lists every read. |
+
+**Currency is special.** Many receipts (e.g. Romanian fuel receipts) print no currency at all:
+- No read finding a currency gives `"confidence": "none"`, and the status stays `ok`.
+- One read finding it while the others don't gives `medium`, not `low`.
+- Currency is `low` only when the reads found **different** currencies (e.g. `RON` vs `EUR`).
+- The prompts tell the models never to deduce the currency from the country or the language.
+
+Recommended Spendle rule: currency `none` means nothing to compare, so **no "needs a look"**. Only
+flag it when the verifier reads a different currency than the declared one with `high`/`medium`.
+
+Boxes come from the models' grounding:
+- Qwen2.5-VL answers in pixels of the image it received. The verifier sends sizes in multiples of 28 within `VERIFY_QWEN25_MAX_PIXELS`, so Ollama doesn't resize again.
+- Qwen3-VL answers on a 0–1000 grid.
+- Both are scaled to the page size. A box outside the image, with zero size, or covering most of the page becomes `null`.
+
+### Live scans keep priority
+- Each verification has its own limit, `VERIFY_CONCURRENCY` (default 1), separate from `LLM_CONCURRENCY`.
+- It starts only after no scan has run for `VERIFY_IDLE_GRACE_S`. If scans keep the GPU busy for longer than `VERIFY_WAIT_IDLE_TIMEOUT`, it answers `error` ("GPU busy") straight away.
+- **Swap mode** (`VERIFY_GPU_MODE=swap`, the default):
+  - the live-scan model is unloaded;
+  - the verifier models are loaded one after the other, and each is checked in `/api/ps` to be **100% on GPU** (if not, the answer is `error` with the reason);
+  - afterwards the verifier models are unloaded and the live-scan model is reloaded with its own `num_ctx`.
+  Swapped models stay in the RAM page cache, so a reload takes seconds.
+- **Preemption:** if a scan starts mid-verification, the verifier's Ollama call is cancelled at once, the live-scan model is reloaded and the answer is `error` ("preempted"). A scan waits at most for that reload, never for a verification.
+- No OCR and no OpenCV run on this path. The CPU work is one PDF render (at `VERIFY_PDF_SCALE`) and a few image resizes.
+- Single-process assumption: the scan tracking lives in memory, so keep one uvicorn worker (already required for OCR).
+
+### Ollama models to pull
+```bash
+ollama pull qwen3-vl:8b-thinking-q8_0   # VERIFY_MODEL
+ollama pull qwen2.5vl:7b-q8_0           # VERIFY_SECOND_MODEL
+# benchmark candidates
+ollama pull qwen3-vl:8b-instruct-q8_0
+ollama pull qwen2.5vl:7b
+```
+Check the exact tags in the Ollama library before pulling. Qwen VL models above 8B (`qwen3-vl:30b`, `qwen3-vl:32b`, `qwen2.5vl:32b`) need about 19 GB or more even at Q4. They can't run 100% on a 16 GB GPU, so they are excluded.
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `VERIFY_MODEL` | `qwen3-vl:8b-thinking-q8_0` | Primary model (reads A, B, C). Thinking is turned on automatically when the model supports it. |
+| `VERIFY_SECOND_MODEL` | `qwen2.5vl:7b-q8_0` | Read D. Empty string disables it. |
+| `VERIFY_CONCURRENCY` | `1` | Verifications at once. |
+| `VERIFY_IMAGE_MAX_SIDE` | `1792` | Longest side of the full-page image (benchmark it: more pixels means more image tokens and VRAM). |
+| `VERIFY_QWEN25_MAX_PIXELS` | `1003520` | Qwen2.5-VL image pixel budget (28·28·1280). |
+| `VERIFY_PDF_SCALE` | `2.5` | PDF render scale for the verifier (pages are still capped at 2048 px). |
+| `VERIFY_NUM_CTX` | `8192` | Context per verifier call: image tokens + prompt + thinking + JSON. |
+| `VERIFY_NUM_PREDICT` | `4096` | Max generated tokens per call, thinking included. |
+| `VERIFY_KEEP_ALIVE` | `2m` | Keep-alive for verifier calls (swap mode unloads them explicitly anyway). |
+| `VERIFY_GPU_MODE` | `swap` | `swap`, or `resident` (only if the measurements show the scanner and the verifier fit together). |
+| `VERIFY_TIMEOUT` | `300` | Seconds per model call. |
+| `VERIFY_TOTAL_TIMEOUT` | `1200` | Seconds per receipt. |
+| `VERIFY_WAIT_IDLE_TIMEOUT` | `60` | Seconds to wait for live scans to end before answering `error`. |
+| `VERIFY_IDLE_GRACE_S` | `10` | Quiet seconds after the last scan before a verification starts. |
+
+### VRAM budget (16 GB RTX 5060 Ti)
+
+| Resident during | Estimate | Measured |
+|---|---|---|
+| PaddleOCR (service process, `auto_growth` keeps what it took) | 1–2 GB | _to fill in_ |
+| Live scan: `qwen3-vl:8b-instruct` Q4, `num_ctx` 8192 × `OLLAMA_NUM_PARALLEL=2` | 9–10 GB | _to fill in_ |
+| Verifier: `qwen3-vl:8b` Q8, `num_ctx` 8192 × 2 | ~11–13 GB | _to fill in_ |
+| Verifier: `qwen2.5vl:7b` Q8, `num_ctx` 8192 × 2 | ~10–12 GB | _to fill in_ |
+
+Live-scan model and Q8 verifier together don't fit, so the default is swap mode. Fill in the
+"Measured" column from `nvidia-smi` / `ollama ps` and the benchmark's peak VRAM. If a Q8 verifier
+doesn't reach 100% GPU next to PaddleOCR, lower `VERIFY_NUM_CTX` or use the Q4 tags.
+
+### Recommended Ollama settings
+- Keep `OLLAMA_KEEP_ALIVE=-1` for the live-scan model. The verifier passes its own `keep_alive` per call and unloads its models explicitly.
+- `OLLAMA_MAX_LOADED_MODELS`: the default is fine in swap mode, because only one model is loaded at a time. Set it to `2` only for `VERIFY_GPU_MODE=resident`.
+- `OLLAMA_NUM_PARALLEL` applies to every model, so the verifier's KV cache is also allocated ×2. If VRAM is tight, lower `VERIFY_NUM_CTX` rather than `OLLAMA_NUM_PARALLEL`, because live scans need the parallelism.
+
+### CPU: only 1 CPU visible
+_To fill in from the hardware investigation (`nproc`, `lscpu`, `cpu.max`, `cpuset.cpus.effective`,
+`systemctl show scanning-tool.service -p CPUQuota -p AllowedCPUs -p CPUAffinity`, `systemd-detect-virt`, `/proc/cmdline`)._
+
+`CPUQuota` (`cpu.max`) throttles a service but doesn't change `nproc`. A single visible CPU comes
+from one of these:
+- a cpuset or affinity setting (`AllowedCPUs=`, `CPUAffinity=`);
+- a VM with 1 vCPU;
+- a kernel `maxcpus=` or `nr_cpus=` option.
+
+Recommendation: give the service and Ollama at least 4–8 of the 12 cores by removing that
+limit. PDF rendering, OCR preprocessing (OpenCV), uvicorn and Ollama's image preprocessing all
+compete for that one CPU today. A person decides; nothing is changed by this repo.
+
+### Benchmark
+On the GPU server, with the service running:
+```bash
+# truth.csv: file,total_amount,currency,receipt_date,document_number   (empty = not printed)
+uv run python scripts/benchmark_verify.py --receipts data/receipts --truth data/truth.csv \
+  --models "qwen3-vl:8b-thinking-q8_0+qwen2.5vl:7b-q8_0,qwen3-vl:8b-instruct-q8_0+qwen2.5vl:7b-q8_0,qwen3-vl:8b-thinking-q8_0" \
+  --out bench.csv [--bbox-check] [--max-side 1792]
+
+# impact on live scans (uses the service's configured VERIFY_MODEL)
+uv run python scripts/benchmark_verify.py --receipts data/receipts --truth data/truth.csv --mode live \
+  --live-scans 10 --scan-interval 45
+```
+Per field and model config, the summary reports:
+- first-pass vs verifier accuracy;
+- mistakes caught (first pass wrong, verifier right);
+- mistakes flagged;
+- false alarms;
+- same-way wrong;
+- accuracy per confidence level;
+- bbox hit rate (`--bbox-check` runs OCR on each box offline, on the CPU by default, so VRAM stays free).
+
+Per config it also reports:
+- average and p95 duration;
+- scanner reload time;
+- peak VRAM;
+- the share of each model on the GPU;
+- wall time vs CPU time.
+
+The CSV has one row per receipt and config.
+
+### Tests
+```bash
+uv run pytest
+```
+They cover normalization, confidence rules, bbox scaling, status rules, the live-scan gate and
+the endpoint contract, all with mocked model responses.
