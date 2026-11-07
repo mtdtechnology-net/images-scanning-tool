@@ -500,7 +500,7 @@ async def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--receipts", type=Path, required=True, help="folder with the receipt files")
     ap.add_argument("--truth", type=Path, required=True, help="CSV: file,total_amount,currency,receipt_date,document_number")
-    ap.add_argument("--models", default="qwen3-vl:8b+qwen2.5vl:7b",
+    ap.add_argument("--models", default="qwen3-vl:8b",
                     help='comma-separated configs, each "primary[+second]"')
     ap.add_argument("--mode", choices=["accuracy", "live", "both"], default="accuracy")
     ap.add_argument("--service", default="http://localhost:8588", help="running scanning service")
