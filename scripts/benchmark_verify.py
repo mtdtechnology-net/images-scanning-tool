@@ -338,8 +338,11 @@ def run_bbox_check(runs: list[ConfigRun], receipts: list[Receipt], device: str) 
     import numpy as np
     from paddleocr import PaddleOCR
     print(f"\n== Bbox check (PaddleOCR on each box, device={device})")
+    # oneDNN (MKL-DNN) on CPU fails with this Paddle build ("ConvertPirAttribute2RuntimeAttribute
+    # not support"), so the CPU check runs without it.
     ocr = PaddleOCR(lang=OCR_LANG, device=device, use_doc_orientation_classify=False,
-                    use_doc_unwarping=False, use_textline_orientation=False)
+                    use_doc_unwarping=False, use_textline_orientation=False,
+                    enable_mkldnn=device != "cpu")
     by_file = {r.file: r for r in receipts}
     images: dict[tuple[str, int], Any] = {}
     for run in runs:
@@ -527,10 +530,15 @@ async def main() -> None:
                 runs.append(await run_verifier_config(config, receipts, sampler, args.max_side))
         finally:
             sampler.stop()
-        if args.bbox_check:
-            run_bbox_check(runs, receipts, args.bbox_ocr_device)
-        summarize(runs)
+        # Save the results first: the optional bbox check must never lose them.
         write_csv(args.out, runs)
+        if args.bbox_check:
+            try:
+                run_bbox_check(runs, receipts, args.bbox_ocr_device)
+                write_csv(args.out, runs)
+            except Exception as e:  # noqa: BLE001 - report and keep the verifier results
+                print(f"\nBbox check failed, results kept without it: {type(e).__name__}: {e}")
+        summarize(runs)
 
     if args.mode in ("live", "both"):
         await run_live(args.service, receipts, args.live_scans, args.scan_interval)
