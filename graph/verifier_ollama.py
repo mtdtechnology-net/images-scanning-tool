@@ -1,6 +1,8 @@
 """Ollama access for the receipt verifier: model loading/swapping, the 100%-on-GPU
 check and the chat call. The reading logic itself lives in graph/verifier.py."""
+import asyncio
 import logging
+import time
 from typing import Optional
 
 import httpx
@@ -46,8 +48,12 @@ class OllamaBackend:
         num_predict: int = VERIFY_NUM_PREDICT,
         keep_alive=VERIFY_KEEP_ALIVE,
         timeout: float = VERIFY_TIMEOUT,
+        unload_wait: float = 30.0,
+        vram_settle: float = 1.0,
     ) -> None:
         self.client = AsyncClient(host=host, timeout=timeout)
+        self.unload_wait = unload_wait    # max seconds to wait for a model to leave /api/ps
+        self.vram_settle = vram_settle    # extra pause for the runner to free its VRAM
         self.gpu_mode = gpu_mode
         self.scanner_model = scanner_model
         self.num_ctx = num_ctx
@@ -133,10 +139,25 @@ class OllamaBackend:
         return resp.message.content or ""
 
     async def _unload(self, model: str) -> None:
+        """Unload `model` and wait until Ollama no longer lists it. Ollama answers the
+        keep_alive=0 request before the runner has released its VRAM; loading the next
+        model straight away would then see too little free memory and spill to the CPU."""
         try:
             await self.client.generate(model=model, prompt="", keep_alive=0)
         except Exception as e:  # not loaded / not pulled / Ollama down: nothing to free
             logger.debug("Unload of %s skipped: %s", model, e)
+            return
+        deadline = time.monotonic() + self.unload_wait
+        while time.monotonic() < deadline:
+            try:
+                ps = await self.client.ps()
+            except Exception:
+                return
+            if not any(_same_model(m.model, model) or _same_model(m.name, model) for m in ps.models):
+                await asyncio.sleep(self.vram_settle)  # the runner process exits right after
+                return
+            await asyncio.sleep(0.25)
+        logger.warning("Model %s still listed by Ollama %.0fs after unloading", model, self.unload_wait)
 
     async def _gpu_share(self, model: str) -> Optional[float]:
         try:
