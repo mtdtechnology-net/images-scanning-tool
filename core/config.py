@@ -28,7 +28,8 @@ LLM_IMAGE_MAX_SIDE = _int("LLM_IMAGE_MAX_SIDE", 1280)
 # qwen3-vl:8b is the thinking variant (Q4_K_M); the "-thinking-q8_0" tags need Ollama > 0.19.
 VERIFY_MODEL = os.getenv("VERIFY_MODEL", "qwen3-vl:8b")
 # Second model, other Qwen generation: read D (full page). Empty string disables it.
-VERIFY_SECOND_MODEL = os.getenv("VERIFY_SECOND_MODEL", "qwen2.5vl:7b-q8_0")
+# The Q8 build (qwen2.5vl:7b-q8_0) loaded only 60% on GPU next to PaddleOCR: use Q4.
+VERIFY_SECOND_MODEL = os.getenv("VERIFY_SECOND_MODEL", "qwen2.5vl:7b")
 # Max verifications at once, separate from LLM_CONCURRENCY (live scans).
 VERIFY_CONCURRENCY = _int("VERIFY_CONCURRENCY", 1)
 # Longest side (px) of the full-page image sent to the verifier models.

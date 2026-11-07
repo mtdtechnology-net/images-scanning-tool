@@ -107,7 +107,7 @@ as the scan endpoints (`MAX_FILE_SIZE_MB`, `MAX_PAGES`).
 {
   "status": "ok",
   "model": "qwen3-vl:8b",
-  "models": ["qwen3-vl:8b", "qwen2.5vl:7b-q8_0"],
+  "models": ["qwen3-vl:8b", "qwen2.5vl:7b"],
   "duration_ms": 18400,
   "pages": [{ "page": 1, "width": 1240, "height": 1754 }],
   "fields": {
@@ -187,7 +187,7 @@ Boxes come from the models' grounding:
 ### Ollama models to pull
 ```bash
 ollama pull qwen3-vl:8b          # VERIFY_MODEL: thinking variant, Q4_K_M
-ollama pull qwen2.5vl:7b-q8_0    # VERIFY_SECOND_MODEL (9.4 GB; fallback qwen2.5vl:7b, Q4)
+ollama pull qwen2.5vl:7b         # VERIFY_SECOND_MODEL (Q4; the 9.4 GB Q8 build loads only 60% on GPU)
 ```
 On the server (Ollama 0.19.0) the `qwen3-vl:8b-thinking-*` and `-q8_0` tags fail with
 "requires a newer version of Ollama". Use them only after an Ollama upgrade (a change to
@@ -199,7 +199,7 @@ Check the exact tags in the Ollama library before pulling. Qwen VL models above 
 | Variable | Default | Description |
 |---|---|---|
 | `VERIFY_MODEL` | `qwen3-vl:8b` | Primary model (reads A, B, C). On Ollama this tag is the **thinking** variant (Q4_K_M); thinking is turned on automatically when the model supports it. |
-| `VERIFY_SECOND_MODEL` | `qwen2.5vl:7b-q8_0` | Read D. Empty string disables it. |
+| `VERIFY_SECOND_MODEL` | `qwen2.5vl:7b` | Read D (Q4). Empty string disables it. `qwen2.5vl:7b-q8_0` loads only 60% on GPU next to PaddleOCR. |
 | `VERIFY_CONCURRENCY` | `1` | Verifications at once. |
 | `VERIFY_IMAGE_MAX_SIDE` | `1792` | Longest side of the full-page image (benchmark it: more pixels means more image tokens and VRAM). |
 | `VERIFY_QWEN25_MAX_PIXELS` | `1003520` | Qwen2.5-VL image pixel budget (28·28·1280). |
@@ -222,7 +222,7 @@ Measured on 2026-11-07, idle, with the service warm (`nvidia-smi`, `ollama ps`):
 | PaddleOCR (service process) | **4,944 MiB** | `auto_growth` keeps the peak it reached; far above the 1–2 GB first assumed |
 | Live scan: `qwen3-vl:8b-instruct` (Q4), context 8192, `OLLAMA_NUM_PARALLEL=2` | **7,012 MiB** (`ollama ps`: 7.5 GB, 100% GPU) | |
 | Total used / available | **11,970 / 16,311 MiB** | ~4.3 GB free |
-| Verifier, swap mode (scanner unloaded, PaddleOCR stays) | ~11 GB available | `qwen3-vl:8b` Q8 needs roughly 11–12 GB with context, so it is borderline; Q4 (~7.5 GB) fits |
+| Verifier, swap mode (scanner unloaded, PaddleOCR stays) | ~11 GB available | Measured: `qwen2.5vl:7b-q8_0` (9.4 GB file) loads only **60% on GPU**, so it is rejected. Q4 builds (~6 GB files) are used. |
 
 Conclusions:
 - **Resident mode is out:** the scanner, PaddleOCR and any ~7B verifier don't fit together (7.0 + 4.9 + 7+ GB > 16 GB). Swap mode it is.
@@ -267,7 +267,7 @@ On the GPU server, with the service running:
 ```bash
 # truth.csv: file,total_amount,currency,receipt_date,document_number   (empty = not printed)
 uv run python scripts/benchmark_verify.py --receipts data/receipts --truth data/truth.csv \
-  --models "qwen3-vl:8b+qwen2.5vl:7b-q8_0,qwen3-vl:8b+qwen2.5vl:7b" \
+  --models "qwen3-vl:8b+qwen2.5vl:7b,qwen3-vl:8b" \
   --out bench.csv [--bbox-check] [--max-side 1792]
 
 # impact on live scans (uses the service's configured VERIFY_MODEL)
