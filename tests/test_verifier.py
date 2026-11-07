@@ -331,3 +331,33 @@ def test_currency_not_printed_is_none_and_receipt_stays_ok():
 def test_conflicting_currencies_are_still_low():
     field, note = combine_field("currency", [r("A", "RON"), r("B", "EUR"), r("D", None)])
     assert field["confidence"] == "low" and "disagree" in note
+
+
+# ─── Unusable answers are retried ────────────────────────────────────────────
+
+class FlakyBackend(FakeBackend):
+    """The first full-page read fails (no JSON, or ran out of tokens while thinking)."""
+    def __init__(self, failure):
+        super().__init__(full_page(), full_page(absolute=True))
+        self.failure, self.failed = failure, False
+
+    async def chat(self, model, prompt, image_b64, schema):
+        if not self.failed and schema is FULL_PAGE_SCHEMA and model == PRIMARY:
+            self.failed = True
+            if isinstance(self.failure, Exception):
+                raise self.failure
+            return self.failure
+        return await super().chat(model, prompt, image_b64, schema)
+
+
+@pytest.mark.parametrize("failure", [
+    "", "<think>long reasoning…</think>", VerifierError("'m' used all 8192 tokens (VERIFY_NUM_PREDICT) before answering"),
+])
+def test_unusable_read_is_retried(failure):
+    resp = run(FlakyBackend(failure))
+    assert resp["status"] == "ok"
+
+
+def test_ollama_errors_are_not_retried():
+    with pytest.raises(VerifierError, match="Ollama error"):
+        run(FlakyBackend(VerifierError("Ollama error from 'm': boom")))

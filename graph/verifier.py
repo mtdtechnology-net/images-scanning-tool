@@ -27,7 +27,7 @@ from typing import Any, Optional, Protocol
 
 from PIL import Image
 
-from core.config import VERIFY_IMAGE_MAX_SIDE, VERIFY_QWEN25_MAX_PIXELS
+from core.config import VERIFY_IMAGE_MAX_SIDE, VERIFY_QWEN25_MAX_PIXELS, VERIFY_READ_RETRIES
 from graph.normalize import FIELDS, NORMALIZERS, loose_key, normalize_amount
 from graph.verifier_ollama import VerifierError
 from prompts.verify import (
@@ -194,11 +194,21 @@ def pick_total_line(lines: list) -> Optional[dict]:
 # ─── Reads ───────────────────────────────────────────────────────────────────
 
 async def _ask(backend: Backend, model: str, prompt: str, img: ModelImage, schema: dict) -> dict:
-    content = await backend.chat(model, prompt, img.b64, schema)
-    data = parse_json(content)
-    if data is None:
-        raise VerifierError(f"'{model}' returned no valid JSON")
-    return data
+    """One read; retried when the model returns nothing usable (a thinking model that ran
+    out of tokens, broken JSON). Transport errors are not retried: they come from Ollama."""
+    error: Optional[VerifierError] = None
+    for attempt in range(1 + max(0, VERIFY_READ_RETRIES)):
+        try:
+            data = parse_json(await backend.chat(model, prompt, img.b64, schema))
+        except VerifierError as e:
+            if "tokens" not in str(e):  # only the token-limit error is worth retrying
+                raise
+            error, data = e, None
+        if data is not None:
+            return data
+        error = error or VerifierError(f"'{model}' returned no valid JSON")
+        logger.info("Verifier %s: unusable answer (attempt %d): %s", model, attempt + 1, error)
+    raise error
 
 
 async def read_full_page(backend: Backend, model: str, source: str, image: Image.Image,

@@ -41,9 +41,16 @@ VERIFY_QWEN25_MAX_PIXELS = _int("VERIFY_QWEN25_MAX_PIXELS", 28 * 28 * 1280)
 # PDF render scale for the verifier (the live scan uses 1.5). Pages are still capped at 2048 px.
 VERIFY_PDF_SCALE = float(os.getenv("VERIFY_PDF_SCALE", "2.5"))
 # Context window for verifier calls: image tokens + prompt + thinking + JSON.
-VERIFY_NUM_CTX = _int("VERIFY_NUM_CTX", 8192)
+VERIFY_NUM_CTX = _int("VERIFY_NUM_CTX", 12288)
 # Max generated tokens per call (includes the thinking of a thinking model).
-VERIFY_NUM_PREDICT = _int("VERIFY_NUM_PREDICT", 4096)
+VERIFY_NUM_PREDICT = _int("VERIFY_NUM_PREDICT", 8192)
+# Sampling for thinking models. Qwen3 warns that greedy decoding (temperature 0) makes thinking
+# models loop until the token limit; these are its recommended values. Non-thinking calls use 0.
+VERIFY_THINK_TEMPERATURE = float(os.getenv("VERIFY_THINK_TEMPERATURE", "0.6"))
+VERIFY_THINK_TOP_P = float(os.getenv("VERIFY_THINK_TOP_P", "0.95"))
+VERIFY_THINK_TOP_K = _int("VERIFY_THINK_TOP_K", 20)
+# Extra attempts when a read returns no valid JSON (e.g. a thinking model ran out of tokens).
+VERIFY_READ_RETRIES = _int("VERIFY_READ_RETRIES", 1)
 _verify_keep_alive = os.getenv("VERIFY_KEEP_ALIVE", "2m")
 VERIFY_KEEP_ALIVE = int(_verify_keep_alive) if _verify_keep_alive.lstrip("-").isdigit() else _verify_keep_alive
 # "swap": unload the scanner model while verifying, reload it afterwards (fits big models).

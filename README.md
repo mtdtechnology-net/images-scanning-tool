@@ -204,8 +204,10 @@ Check the exact tags in the Ollama library before pulling. Qwen VL models above 
 | `VERIFY_IMAGE_MAX_SIDE` | `1792` | Longest side of the full-page image (benchmark it: more pixels means more image tokens and VRAM). |
 | `VERIFY_QWEN25_MAX_PIXELS` | `1003520` | Qwen2.5-VL image pixel budget (28·28·1280). |
 | `VERIFY_PDF_SCALE` | `2.5` | PDF render scale for the verifier (pages are still capped at 2048 px). |
-| `VERIFY_NUM_CTX` | `8192` | Context per verifier call: image tokens + prompt + thinking + JSON. |
-| `VERIFY_NUM_PREDICT` | `4096` | Max generated tokens per call, thinking included. |
+| `VERIFY_NUM_CTX` | `12288` | Context per verifier call: image tokens (~2,300 at 1792 px) + prompt + thinking + JSON. |
+| `VERIFY_NUM_PREDICT` | `8192` | Max generated tokens per call, thinking included. With 4096, a third of the reads ran out of tokens while thinking. |
+| `VERIFY_THINK_TEMPERATURE` / `_TOP_P` / `_TOP_K` | `0.6` / `0.95` / `20` | Sampling for thinking models (Qwen's recommendation). Greedy decoding (temperature 0) makes them loop until the token limit. Non-thinking calls use temperature 0. |
+| `VERIFY_READ_RETRIES` | `1` | Extra attempts for a read that returns no valid JSON. |
 | `VERIFY_KEEP_ALIVE` | `2m` | Keep-alive for verifier calls (swap mode unloads them explicitly anyway). |
 | `VERIFY_GPU_MODE` | `swap` | `swap`, or `resident` (only if the measurements show the scanner and the verifier fit together). |
 | `VERIFY_TIMEOUT` | `300` | Seconds per model call. |

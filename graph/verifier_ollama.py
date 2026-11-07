@@ -10,7 +10,8 @@ from ollama import AsyncClient, ResponseError
 
 from core.config import (
     OLLAMA_BASE_URL, OLLAMA_KEEP_ALIVE, OLLAMA_MODEL, OLLAMA_NUM_CTX,
-    VERIFY_GPU_MODE, VERIFY_KEEP_ALIVE, VERIFY_NUM_CTX, VERIFY_NUM_PREDICT, VERIFY_TIMEOUT,
+    VERIFY_GPU_MODE, VERIFY_KEEP_ALIVE, VERIFY_NUM_CTX, VERIFY_NUM_PREDICT,
+    VERIFY_THINK_TEMPERATURE, VERIFY_THINK_TOP_K, VERIFY_THINK_TOP_P, VERIFY_TIMEOUT,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,23 +121,33 @@ class OllamaBackend:
 
     async def chat(self, model: str, prompt: str, image_b64: str, schema: dict) -> str:
         """One structured call with one image. Returns the raw message content."""
-        extra = {"think": True} if self._thinking.get(model) else {}
+        thinking = self._thinking.get(model, False)
+        options = {"num_ctx": self.num_ctx, "num_predict": self.num_predict}
+        if thinking:
+            options.update(temperature=VERIFY_THINK_TEMPERATURE, top_p=VERIFY_THINK_TOP_P, top_k=VERIFY_THINK_TOP_K)
+        else:
+            options["temperature"] = 0
         try:
             resp = await self.client.chat(
                 model=model,
                 messages=[{"role": "user", "content": prompt, "images": [image_b64]}],
                 format=schema,
-                options={"temperature": 0, "num_ctx": self.num_ctx, "num_predict": self.num_predict},
+                options=options,
                 keep_alive=self.keep_alive,
-                **extra,
+                **({"think": True} if thinking else {}),
             )
         except ResponseError as e:
             raise VerifierError(f"Ollama error from '{model}': {e.error}") from e
         except _TRANSPORT_ERRORS as e:
             raise VerifierError(f"Ollama call to '{model}' failed: {type(e).__name__}") from e
-        logger.info("Verifier %s: prompt_tokens=%s output_tokens=%s",
-                    model, resp.prompt_eval_count, resp.eval_count)
-        return resp.message.content or ""
+        thought = len(resp.message.thinking or "") if thinking else 0
+        logger.info("Verifier %s: prompt_tokens=%s output_tokens=%s thinking_chars=%s done_reason=%s",
+                    model, resp.prompt_eval_count, resp.eval_count, thought, resp.done_reason)
+        content = resp.message.content or ""
+        if not content.strip() and resp.done_reason == "length":
+            raise VerifierError(f"'{model}' used all {self.num_predict} tokens (VERIFY_NUM_PREDICT) "
+                                "before answering" + (" while thinking" if thinking else ""))
+        return content
 
     async def _unload(self, model: str) -> None:
         """Unload `model` and wait until Ollama no longer lists it. Ollama answers the
