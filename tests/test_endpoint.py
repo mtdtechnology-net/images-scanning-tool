@@ -6,14 +6,8 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import main
-from core.config import VERIFY_MODEL, VERIFY_SECOND_MODEL
 from graph.verifier_ollama import VerifierError
-from tests.test_verifier import FakeBackend, full_page
-
-pytestmark = pytest.mark.skipif(
-    (VERIFY_MODEL, VERIFY_SECOND_MODEL) != ("qwen3-vl:8b-thinking-q8_0", "qwen2.5vl:7b-q8_0"),
-    reason="canned answers are keyed on the default verifier models",
-)
+from tests.test_verifier import PRIMARY, SECOND, FakeBackend, full_page
 
 
 class EndpointBackend(FakeBackend):
@@ -44,6 +38,9 @@ def _png() -> bytes:
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setattr(main, "VERIFY_IDLE_GRACE_S", 0)
+    # Canned answers are keyed on these model names, whatever the env configures.
+    monkeypatch.setattr(main, "VERIFY_MODEL", PRIMARY)
+    monkeypatch.setattr(main, "VERIFY_SECOND_MODEL", SECOND)
     return TestClient(main.app)  # no `with`: skips the OCR/Ollama warm-up
 
 
@@ -55,7 +52,7 @@ def test_verify_receipt_contract(client, monkeypatch):
     body = resp.json()
     assert list(body) == ["status", "model", "models", "duration_ms", "pages", "fields", "notes"]
     assert body["status"] == "ok"
-    assert body["model"] == VERIFY_MODEL
+    assert body["model"] == PRIMARY
     assert body["pages"] == [{"page": 1, "width": 1000, "height": 2000}]
     assert set(body["fields"]) == {"total_amount", "currency", "receipt_date", "document_number"}
     for f in body["fields"].values():

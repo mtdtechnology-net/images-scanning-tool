@@ -5,7 +5,7 @@ Run on the GPU server, from the repo root, with the service running:
 
   uv run python scripts/benchmark_verify.py \\
       --receipts data/receipts --truth data/truth.csv \\
-      --models "qwen3-vl:8b-thinking-q8_0+qwen2.5vl:7b-q8_0,qwen3-vl:8b-instruct-q8_0+qwen2.5vl:7b-q8_0" \\
+      --models "qwen3-vl:8b+qwen2.5vl:7b-q8_0,qwen3-vl:8b+qwen2.5vl:7b" \\
       --out bench.csv
 
 truth.csv columns: file,total_amount,currency,receipt_date,document_number
@@ -500,10 +500,10 @@ async def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--receipts", type=Path, required=True, help="folder with the receipt files")
     ap.add_argument("--truth", type=Path, required=True, help="CSV: file,total_amount,currency,receipt_date,document_number")
-    ap.add_argument("--models", default="qwen3-vl:8b-thinking-q8_0+qwen2.5vl:7b-q8_0",
+    ap.add_argument("--models", default="qwen3-vl:8b+qwen2.5vl:7b-q8_0",
                     help='comma-separated configs, each "primary[+second]"')
     ap.add_argument("--mode", choices=["accuracy", "live", "both"], default="accuracy")
-    ap.add_argument("--service", default="http://localhost:8000", help="running scanning service")
+    ap.add_argument("--service", default="http://localhost:8588", help="running scanning service")
     ap.add_argument("--max-side", type=int, default=VERIFY_IMAGE_MAX_SIDE, help="VERIFY_IMAGE_MAX_SIDE to test")
     ap.add_argument("--out", type=Path, default=Path("benchmark_verify.csv"))
     ap.add_argument("--bbox-check", action="store_true", help="OCR each returned box (offline, after the runs)")

@@ -25,7 +25,8 @@ LLM_IMAGE_MAX_SIDE = _int("LLM_IMAGE_MAX_SIDE", 1280)
 # ─── Receipt verifier (POST /api/verify-receipt) ─────────────────────────────
 # Background re-read of submitted receipts, image only (no OCR). Accuracy over speed.
 # Primary model: reads A (full page), B (amount lines), C (zoom on each field).
-VERIFY_MODEL = os.getenv("VERIFY_MODEL", "qwen3-vl:8b-thinking-q8_0")
+# qwen3-vl:8b is the thinking variant (Q4_K_M); the "-thinking-q8_0" tags need Ollama > 0.19.
+VERIFY_MODEL = os.getenv("VERIFY_MODEL", "qwen3-vl:8b")
 # Second model, other Qwen generation: read D (full page). Empty string disables it.
 VERIFY_SECOND_MODEL = os.getenv("VERIFY_SECOND_MODEL", "qwen2.5vl:7b-q8_0")
 # Max verifications at once, separate from LLM_CONCURRENCY (live scans).

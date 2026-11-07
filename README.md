@@ -106,8 +106,8 @@ as the scan endpoints (`MAX_FILE_SIZE_MB`, `MAX_PAGES`).
 ```json
 {
   "status": "ok",
-  "model": "qwen3-vl:8b-thinking-q8_0",
-  "models": ["qwen3-vl:8b-thinking-q8_0", "qwen2.5vl:7b-q8_0"],
+  "model": "qwen3-vl:8b",
+  "models": ["qwen3-vl:8b", "qwen2.5vl:7b-q8_0"],
   "duration_ms": 18400,
   "pages": [{ "page": 1, "width": 1240, "height": 1754 }],
   "fields": {
@@ -186,19 +186,19 @@ Boxes come from the models' grounding:
 
 ### Ollama models to pull
 ```bash
-ollama pull qwen3-vl:8b-thinking-q8_0   # VERIFY_MODEL
-ollama pull qwen2.5vl:7b-q8_0           # VERIFY_SECOND_MODEL
-# benchmark candidates
-ollama pull qwen3-vl:8b-instruct-q8_0
-ollama pull qwen2.5vl:7b
+ollama pull qwen3-vl:8b          # VERIFY_MODEL: thinking variant, Q4_K_M
+ollama pull qwen2.5vl:7b-q8_0    # VERIFY_SECOND_MODEL (9.4 GB; fallback qwen2.5vl:7b, Q4)
 ```
+On the server (Ollama 0.19.0) the `qwen3-vl:8b-thinking-*` and `-q8_0` tags fail with
+"requires a newer version of Ollama". Use them only after an Ollama upgrade (a change to
+production: test live scans afterwards).
 Check the exact tags in the Ollama library before pulling. Qwen VL models above 8B (`qwen3-vl:30b`, `qwen3-vl:32b`, `qwen2.5vl:32b`) need about 19 GB or more even at Q4. They can't run 100% on a 16 GB GPU, so they are excluded.
 
 ### Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `VERIFY_MODEL` | `qwen3-vl:8b-thinking-q8_0` | Primary model (reads A, B, C). Thinking is turned on automatically when the model supports it. |
+| `VERIFY_MODEL` | `qwen3-vl:8b` | Primary model (reads A, B, C). On Ollama this tag is the **thinking** variant (Q4_K_M); thinking is turned on automatically when the model supports it. |
 | `VERIFY_SECOND_MODEL` | `qwen2.5vl:7b-q8_0` | Read D. Empty string disables it. |
 | `VERIFY_CONCURRENCY` | `1` | Verifications at once. |
 | `VERIFY_IMAGE_MAX_SIDE` | `1792` | Longest side of the full-page image (benchmark it: more pixels means more image tokens and VRAM). |
@@ -267,7 +267,7 @@ On the GPU server, with the service running:
 ```bash
 # truth.csv: file,total_amount,currency,receipt_date,document_number   (empty = not printed)
 uv run python scripts/benchmark_verify.py --receipts data/receipts --truth data/truth.csv \
-  --models "qwen3-vl:8b-thinking-q8_0+qwen2.5vl:7b-q8_0,qwen3-vl:8b-instruct-q8_0+qwen2.5vl:7b-q8_0,qwen3-vl:8b-thinking-q8_0" \
+  --models "qwen3-vl:8b+qwen2.5vl:7b-q8_0,qwen3-vl:8b+qwen2.5vl:7b" \
   --out bench.csv [--bbox-check] [--max-side 1792]
 
 # impact on live scans (uses the service's configured VERIFY_MODEL)
