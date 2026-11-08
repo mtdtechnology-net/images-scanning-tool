@@ -40,7 +40,8 @@ Return JSON with:
   change is given), NOT the change (REST).
 - currency: the currency as printed (e.g. LEI, RON, EUR, €). Many receipts print no currency:
   then return "". Never deduce it from the country, the language or the shop.
-- receipt_date: the date the document was issued, as printed.
+- receipt_date: the date the document was issued, as printed. Copy every digit exactly, the year
+  included: documents from 2026 and later are normal. Never correct or adjust a date.
 - document_number: the receipt/invoice number as printed (e.g. "Nr. bon", "Factura nr.", "Seria ... nr ...").
 
 For each of the four fields return:
@@ -68,10 +69,13 @@ AMOUNT_LINES_SCHEMA = {
             },
         },
         "currency_text": {"type": "string"},
+        "currency_bbox_2d": {"type": "array", "items": {"type": "number"}},
         "date_text": {"type": "string"},
+        "date_bbox_2d": {"type": "array", "items": {"type": "number"}},
         "document_number_text": {"type": "string"},
     },
-    "required": ["amount_lines", "currency_text", "date_text", "document_number_text"],
+    "required": ["amount_lines", "currency_text", "currency_bbox_2d", "date_text", "date_bbox_2d",
+                 "document_number_text"],
 }
 
 AMOUNT_LINES_PROMPT = """This image is a receipt or invoice. Copy what is printed; do not calculate anything.
@@ -85,7 +89,10 @@ AMOUNT_LINES_PROMPT = """This image is a receipt or invoice. Copy what is printe
      "payment", "change", "other";
    - "bbox_2d": [x1, y1, x2, y2] around the amount.
 2. "currency_text": the currency as printed; "" if no currency is printed (never deduce it).
-3. "date_text": the issue date as printed ("" if none).
+   "currency_bbox_2d": [x1, y1, x2, y2] around it ([] if none).
+3. "date_text": the issue date as printed, every digit copied exactly, the year included (documents
+   from 2026 and later are normal; never correct a date). "" if none.
+   "date_bbox_2d": [x1, y1, x2, y2] around it ([] if none).
 4. "document_number_text": the receipt/invoice number as printed ("" if none)."""
 
 # Read C (primary model): a zoomed crop around one field found by read A.
@@ -100,7 +107,7 @@ ZOOM_TARGETS = {
                     "the VAT line, the cash handed over or the change)",
     "currency": "the currency printed next to the total (e.g. LEI, RON, EUR, €); "
                 "if no currency is printed, return an empty string",
-    "receipt_date": "the date the document was issued",
+    "receipt_date": "the date the document was issued (copy the year exactly as printed; never correct it)",
     "document_number": "the receipt/invoice number",
 }
 

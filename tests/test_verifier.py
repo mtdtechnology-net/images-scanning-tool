@@ -129,7 +129,7 @@ def test_disagreement_is_low_with_majority_value_and_note():
         r("A", 100.84, BOX_A), r("B", 120.0), r("C", 120.0), r("D", 120.0, BOX_D),
     ])
     assert field["confidence"] == "low"
-    assert field["value"] == 120.0 and field["bbox"] == BOX_D
+    assert field["value"] == 120.0 and field["bbox"] is None  # only D boxed it: unconfirmed
     assert "reads disagree" in note and "A=100.84" in note and "D=120.00" in note
 
 
@@ -194,7 +194,9 @@ def amount_lines(total="120,00", box=True) -> dict:
             {"label": "TOTAL", "amount_text": total, "kind": "total", "bbox_2d": [412, 940, 590, 966] if box else []},
             {"label": "REST", "amount_text": "30,00", "kind": "change", "bbox_2d": []},
         ],
-        "currency_text": "LEI", "date_text": "03.11.2026", "document_number_text": "Nr. F-0042",
+        "currency_text": "LEI", "currency_bbox_2d": [600, 940, 660, 966] if box else [],
+        "date_text": "03.11.2026", "date_bbox_2d": [100, 150, 300, 170] if box else [],
+        "document_number_text": "Nr. F-0042",
     }
 
 
@@ -244,8 +246,8 @@ def test_clean_receipt_is_ok_and_high():
     assert resp["fields"]["receipt_date"]["value"] == "2026-11-03"
     assert resp["fields"]["document_number"]["value"] == "F-0042"
     assert resp["notes"] is None
-    # A, B, then one zoom per located field on the primary model, then D on the second.
-    assert backend.calls == [(PRIMARY, "full"), (PRIMARY, "lines")] + [(PRIMARY, "zoom")] * 4 + [(SECOND, "full")]
+    # A, B, a zoom on total/currency/date (not the document number), then D on the second model.
+    assert backend.calls == [(PRIMARY, "full"), (PRIMARY, "lines")] + [(PRIMARY, "zoom")] * 3 + [(SECOND, "full")]
 
 
 def test_subtotal_misread_by_one_read_makes_total_unreadable():
@@ -361,3 +363,56 @@ def test_unusable_read_is_retried(failure):
 def test_ollama_errors_are_not_retried():
     with pytest.raises(VerifierError, match="Ollama error"):
         run(FlakyBackend(VerifierError("Ollama error from 'm': boom")))
+
+
+# ─── Boxes need a second read; total must match the payment ──────────────────
+
+def test_single_box_is_not_trusted():
+    field, _ = combine_field("total_amount", [r("A", 120.0, BOX_A), r("B", 120.0), r("C", 120.0)])
+    assert field["bbox"] is None and field["confidence"] == "medium"
+
+
+def test_boxes_on_different_spots_are_not_trusted():
+    field, _ = combine_field("total_amount", [r("A", 120.0, BOX_A), r("B", 120.0, [100, 300, 200, 340])])
+    assert field["bbox"] is None and field["confidence"] == "medium"
+
+
+def test_two_matching_boxes_make_it_high():
+    field, _ = combine_field("total_amount", [r("A", 120.0, BOX_A), r("B", 120.0, BOX_D)])
+    assert field["bbox"] == BOX_A and field["confidence"] == "high"
+
+
+def test_paid_amount():
+    from graph.verifier import paid_amount
+    assert paid_amount([{"kind": "payment", "amount_text": "150,00"},
+                        {"kind": "change", "amount_text": "30,00"}]) == 120.0
+    # the same card payment printed twice counts once
+    assert paid_amount([{"kind": "payment", "amount_text": "245.18"},
+                        {"kind": "payment", "amount_text": "245.18"}]) == 245.18
+    assert paid_amount([{"kind": "total", "amount_text": "120,00"}]) is None
+
+
+def _lines_with_payment(total: str, paid: str) -> dict:
+    lines = amount_lines(total)
+    lines["amount_lines"] = [l for l in lines["amount_lines"] if l["kind"] != "change"] + [
+        {"label": "CARD", "amount_text": paid, "kind": "payment", "bbox_2d": []},
+        {"label": "REST", "amount_text": "0.00", "kind": "change", "bbox_2d": []},
+    ]
+    return lines
+
+
+def test_total_matching_payment_stays_ok():
+    backend = FakeBackend(full_page(), full_page(absolute=True), lines=_lines_with_payment("120,00", "120.00"))
+    assert run(backend)["status"] == "ok"
+
+
+def test_faded_total_contradicted_by_payment_is_unreadable():
+    """The 245.1 vs CARD 245.18 receipt: every read agrees on the faded TOTAL, the payment doesn't."""
+    full = lambda **kw: full_page(total="245.1", **kw)  # noqa: E731
+    backend = FakeBackend(full(), full(absolute=True), lines=_lines_with_payment("245.1", "245.18"),
+                          zoom={"total_amount": "245.1", "currency": "LEI", "receipt_date": "03.11.2026",
+                                "document_number": "F-0042"})
+    resp = run(backend)
+    assert resp["status"] == "unreadable"
+    assert resp["fields"]["total_amount"]["confidence"] == "low"
+    assert "245.18" in resp["notes"]

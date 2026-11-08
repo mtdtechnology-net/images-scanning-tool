@@ -147,16 +147,29 @@ An unsupported or corrupt file is a client error: HTTP 400 like the other endpoi
 |---|---|---|---|
 | A | `VERIFY_MODEL` | every page, longest side `VERIFY_IMAGE_MAX_SIDE` | all four fields, each with a box; document type; receipt count |
 | B | `VERIFY_MODEL` | the total's page at 0.75× that size, other prompt | every amount line with its label (subtotal, VAT, total, cash, change); code picks the final total |
-| C | `VERIFY_MODEL` | a full-width strip around each field A located, enlarged up to 2× | that one value again, at a higher resolution |
+| C | `VERIFY_MODEL` | a full-width strip around the total, currency and date A located, enlarged up to 2× | that one value again, at a higher resolution (not done for the document number, which is informative only) |
 | D | `VERIFY_SECOND_MODEL` (another Qwen generation) | the pages where A found fields | the same as A |
 
 Confidence is measured from agreement, never self-reported:
 
 | Confidence | When |
 |---|---|
-| `high` | every read that ran agrees after normalization, and a model located the value with a box |
+| `high` | every read that ran agrees after normalization, and **two reads put a box on the same spot** |
 | `medium` | they agree but there is no usable box, a read did not find the value, or they differ only in formatting (`F-0042` vs `F42`) |
 | `low` | they disagree, or only one read found the value. The majority value is returned and `notes` lists every read. |
+
+**Total vs payment.** Read B also lists the payment lines (CARD, NUMERAR/CASH) and the change (REST).
+If the total that was read differs from *payment − change*, both printed on the receipt, the total
+gets `low` and the status becomes `unreadable`. This catches a faded last digit that every read
+gets wrong the same way (e.g. `TOTAL LEI 245.1` next to `CARD 245.18`).
+
+**Boxes need two reads.** A box is returned only when two reads (e.g. A and B) put it on the same
+spot (≥30% overlap). On the first benchmark about a third of the single-read boxes were on the wrong
+line or off the receipt.
+
+**Document number is informative.** It is read (A, B) and returned, but it never changes the
+status. Receipts carry several numbers (fiscal receipt, card slip `RECEIPT NO`, transaction), so the
+Spendle backend should not raise "needs a look" on it.
 
 **Currency is special.** Many receipts (e.g. Romanian fuel receipts) print no currency at all:
 - No read finding a currency gives `"confidence": "none"`, and the status stays `ok`.

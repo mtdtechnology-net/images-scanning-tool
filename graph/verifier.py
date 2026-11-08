@@ -8,7 +8,7 @@ declared. Confidence comes from agreement between independent reads, not from th
   C  primary model, zoomed strip around each field A located
   D  second model (other Qwen generation), full page + boxes   (pages where A found fields)
 
-  high    every read that ran agrees after normalization, and a box grounds the value
+  high    every read that ran agrees after normalization, and two reads put a box on the same spot
   medium  reads agree but there is no reliable box, a read did not find the value,
           or they differ only in formatting (document number "F-0042" vs "F42")
   low     reads disagree; the majority value is returned and `notes` lists every read
@@ -229,22 +229,40 @@ async def read_full_page(backend: Backend, model: str, source: str, image: Image
     return PageRead(doc_type, count, fields)
 
 
+def paid_amount(lines: list) -> Optional[float]:
+    """What the receipt says was paid: payment lines minus change, or None without payment lines.
+    Identical payment amounts are counted once (the same card payment is often printed twice)."""
+    payments, change = set(), 0.0
+    for line in lines or []:
+        if not isinstance(line, dict):
+            continue
+        amount = normalize_amount(_text(line.get("amount_text")))
+        if amount is None:
+            continue
+        if line.get("kind") == "payment":
+            payments.add(amount)
+        elif line.get("kind") == "change":
+            change += amount
+    return round(sum(payments) - change, 2) if payments else None
+
+
 async def read_amount_lines(backend: Backend, model: str, image: Image.Image, page: int,
-                            max_side: int) -> dict[str, Reading]:
+                            max_side: int) -> tuple[dict[str, Reading], Optional[float]]:
+    """Read B: labelled amount lines (code picks the total) + the other fields again.
+    Also returns the paid amount (payments − change) printed on the receipt, if any."""
     img = prepare_image(image, model, max(256, int(max_side * READ_B_SCALE)))
     data = await _ask(backend, model, AMOUNT_LINES_PROMPT, img, AMOUNT_LINES_SCHEMA)
     lines = data.get("amount_lines") if isinstance(data.get("amount_lines"), list) else []
     total = pick_total_line(lines)
-    total_bbox = None
-    if total:
-        total_bbox = scale_bbox(total.get("bbox_2d"), bbox_mode(model), img.width, img.height, *image.size)
-    return {
+    box = lambda b: scale_bbox(b, bbox_mode(model), img.width, img.height, *image.size)  # noqa: E731
+    readings = {
         "total_amount": make_reading("B", "total_amount", total.get("amount_text") if total else None,
-                                     page, total_bbox),
-        "currency": make_reading("B", "currency", data.get("currency_text"), page),
-        "receipt_date": make_reading("B", "receipt_date", data.get("date_text"), page),
+                                     page, box(total.get("bbox_2d")) if total else None),
+        "currency": make_reading("B", "currency", data.get("currency_text"), page, box(data.get("currency_bbox_2d"))),
+        "receipt_date": make_reading("B", "receipt_date", data.get("date_text"), page, box(data.get("date_bbox_2d"))),
         "document_number": make_reading("B", "document_number", data.get("document_number_text"), page),
     }
+    return readings, paid_amount(lines)
 
 
 async def read_zoom(backend: Backend, model: str, fld: str, image: Image.Image, bbox: list[int],
@@ -277,9 +295,7 @@ def combine_field(fld: str, readings: list[Reading]) -> tuple[dict, Optional[str
         groups.setdefault(r.value, []).append(r)
     chosen = max(groups, key=lambda v: (len(groups[v]), -min(VALUE_PRIORITY[r.source] for r in groups[v])))
     support = sorted(groups[chosen], key=lambda r: VALUE_PRIORITY[r.source])
-    boxed = sorted((r for r in support if r.bbox), key=lambda r: BBOX_PRIORITY.index(r.source)
-                   if r.source in BBOX_PRIORITY else len(BBOX_PRIORITY))
-    bbox_reading = boxed[0] if boxed else None
+    bbox_reading = confirmed_box(support)
     missing = [r.source for r in readings if r.value is None]
     loose = {loose_key(fld, r.value) for r in present}
 
@@ -315,9 +331,32 @@ def combine_field(fld: str, readings: list[Reading]) -> tuple[dict, Optional[str
     }, note
 
 
+def boxes_agree(a: list[int], b: list[int]) -> bool:
+    """Two boxes point at the same spot: they overlap by at least 30% of the smaller one."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return False
+    smaller = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return w * h >= 0.3 * smaller
+
+
+def confirmed_box(support: list[Reading]) -> Optional[Reading]:
+    """The reading whose box is confirmed by another read's box on the same spot. A single
+    box is not trusted: models sometimes place it on the wrong line or off the receipt."""
+    boxed = sorted((r for r in support if r.bbox), key=lambda r: BBOX_PRIORITY.index(r.source)
+                   if r.source in BBOX_PRIORITY else len(BBOX_PRIORITY))
+    for i, r in enumerate(boxed):
+        if any(o.page == r.page and boxes_agree(r.bbox, o.bbox) for o in boxed[i + 1:]):
+            return r
+    return None
+
+
 # ─── Orchestration ───────────────────────────────────────────────────────────
 
 DOC_TYPES = ("receipt", "invoice")
+# Read C (zoom) only where it matters: the document number is informative, not compared.
+ZOOM_FIELDS = ("total_amount", "currency", "receipt_date")
 
 
 @dataclass
@@ -344,6 +383,7 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
     """Run every read on the page images and build the API response (without duration_ms)."""
     pages = [decode_page(b64) for b64 in images_b64]
     notes: list[str] = []
+    paid: Optional[float] = None
     readings: dict[str, list[Reading]] = {fld: [] for fld in FIELDS}
 
     # ── Primary model: A on every page ──
@@ -358,13 +398,13 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
     if doc_pages:
         total_page = field_page["total_amount"]
         try:
-            b = await read_amount_lines(backend, primary, pages[total_page], total_page, max_side)
+            b, paid = await read_amount_lines(backend, primary, pages[total_page], total_page, max_side)
             for fld in FIELDS:
                 if field_page[fld] == total_page:
                     readings[fld].append(b[fld])
         except VerifierError as e:
             notes.append(f"read B failed ({e})")
-        for fld in FIELDS:
+        for fld in ZOOM_FIELDS:
             a = a_reads[field_page[fld]].fields[fld]
             if a.bbox is None:
                 continue
@@ -394,6 +434,13 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
         if note:
             notes.append(note)
 
+    # The total must match what the receipt says was paid (payment lines − change), both printed.
+    total = fields["total_amount"]
+    if paid is not None and total["value"] is not None and abs(total["value"] - paid) > 0.005:
+        total["confidence"] = "low"
+        notes.append(f"total_amount: the total read ({total['value']:.2f}) differs from the payment "
+                     f"printed on the receipt minus change ({paid:.2f})")
+
     # ── Status ──
     status = "ok"
     a_types = [r.document_type for r in a_reads]
@@ -420,7 +467,7 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
             notes.insert(0, "No total amount found on the document.")
         elif fields["total_amount"]["confidence"] == "low":
             status = "unreadable"
-            notes.insert(0, "The reads disagree on the total amount.")
+            notes.insert(0, "The total amount is uncertain (see total_amount below).")
         totals = {a_reads[i].fields["total_amount"].value for i in doc_pages} - {None}
         if len(totals) > 1 and status == "ok":
             notes.append(f"pages show different totals; using page {field_page['total_amount'] + 1}")
