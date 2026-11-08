@@ -42,6 +42,7 @@ def _normalize_category(category: str) -> str:
 _DATE_PATTERNS = [
     r'\d{1,2}[.]\d{1,2}[.]\d{2,4}',            # 08.07.2026
     r'\d{1,2}/\d{1,2}/\d{2,4}',                 # 08/07/2026
+    r'\d{1,2}-\d{1,2}-\d{4}',                    # 08-07-2026 (Rompetrol: "DATA: 13-02-2026")
     r'\d{4}\s*-\s*\d{2}\s*-\s*\d{2}',           # 2026-07-08
     r'\d{1,2}\s*-\s*[A-Z]{3}\s*-\s*\d{4}',      # 20-NOV-2024
     r'\d{1,2}\s+[A-Z]{3}\s+\d{4}',              # 20 NOV 2024
@@ -127,6 +128,12 @@ def _validate_receipt_date(receipt_date: str, ocr_text: str) -> bool:
     return False
 
 
+def _last_ocr_date(ocr_text: str) -> str:
+    """Last DD.MM.YYYY / DD/MM/YYYY / DD-MM-YYYY date in the OCR text, or ""."""
+    all_dates = re.findall(r"\b(\d{2}[./-]\d{2}[./-]\d{4})\b", ocr_text)
+    return all_dates[-1] if all_dates else ""
+
+
 # ─── Hybrid Extraction (OCR text + image → LLM) ─────────────────────────────
 
 async def run_extraction_hybrid(text: str, image_b64: str, doc_index: int) -> list | str:
@@ -177,9 +184,9 @@ async def run_extraction_hybrid(text: str, image_b64: str, doc_index: int) -> li
 
     # ── Guardrail 2: post-fix extract receipt_date from OCR if LLM missed it ──
     if not exp.receipt_date:
-        all_dates = re.findall(r"\b(\d{2}[./]\d{2}[./]\d{4})\b", text)
-        if all_dates:
-            exp.receipt_date = all_dates[-1]
+        last_date = _last_ocr_date(text)
+        if last_date:
+            exp.receipt_date = last_date
             logger.info("Guardrail: extracted receipt_date from OCR: %s", exp.receipt_date)
 
     # Format city and country in Title Case (e.g. SIBIU -> Sibiu)
