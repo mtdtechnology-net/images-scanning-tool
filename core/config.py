@@ -63,6 +63,10 @@ VERIFY_WAIT_IDLE_TIMEOUT = _int("VERIFY_WAIT_IDLE_TIMEOUT", 60)
 # A verification starts only after no live scan has run for this many seconds.
 VERIFY_IDLE_GRACE_S = float(os.getenv("VERIFY_IDLE_GRACE_S", "10"))
 
+# OCR as an independent witness for the total and the currency (the model never sees OCR text).
+# Runs once on the total's page, on the same PaddleOCR instance as live scans (~1-2 s on GPU).
+VERIFY_OCR_WITNESS = os.getenv("VERIFY_OCR_WITNESS", "true").strip().lower() in ("1", "true", "yes")
+
 # ─── OCR ─────────────────────────────────────────────────────────────────────
 OCR_DEVICE = os.getenv("OCR_DEVICE", "cpu")  # "gpu" on the server
 OCR_LANG = os.getenv("OCR_LANG", "ro")  # Latin model, keeps Romanian diacritics

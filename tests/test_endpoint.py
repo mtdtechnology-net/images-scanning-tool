@@ -41,6 +41,10 @@ def client(monkeypatch):
     # Canned answers are keyed on these model names, whatever the env configures.
     monkeypatch.setattr(main, "VERIFY_MODEL", PRIMARY)
     monkeypatch.setattr(main, "VERIFY_SECOND_MODEL", SECOND)
+
+    async def no_ocr(image):  # keep PaddleOCR out of the endpoint tests
+        return []
+    monkeypatch.setattr(main, "ocr_page_lines", no_ocr)
     return TestClient(main.app)  # no `with`: skips the OCR/Ollama warm-up
 
 

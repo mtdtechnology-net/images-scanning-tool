@@ -23,12 +23,13 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional, Protocol
+from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from PIL import Image
 
 from core.config import VERIFY_IMAGE_MAX_SIDE, VERIFY_QWEN25_MAX_PIXELS, VERIFY_READ_RETRIES
 from graph.normalize import FIELDS, NORMALIZERS, loose_key, normalize_amount
+from graph.ocr_witness import OcrLine, apply_currency_witness, apply_total_witness, build_evidence
 from graph.verifier_ollama import VerifierError
 from prompts.verify import (
     AMOUNT_LINES_PROMPT, AMOUNT_LINES_SCHEMA, FULL_PAGE_PROMPT, FULL_PAGE_SCHEMA,
@@ -378,9 +379,14 @@ def _field_pages(a_reads: list[PageRead], doc_pages: list[int]) -> dict[str, int
     return pages
 
 
+OcrFn = Callable[[Image.Image], Awaitable[list[tuple[str, list[int]]]]]
+
+
 async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
-                       second: Optional[str] = None, max_side: int = VERIFY_IMAGE_MAX_SIDE) -> Outcome:
-    """Run every read on the page images and build the API response (without duration_ms)."""
+                       second: Optional[str] = None, max_side: int = VERIFY_IMAGE_MAX_SIDE,
+                       ocr: Optional[OcrFn] = None) -> Outcome:
+    """Run every read on the page images and build the API response (without duration_ms).
+    `ocr(page_image)` (optional) returns (text, box) lines: the independent OCR witness."""
     pages = [decode_page(b64) for b64 in images_b64]
     notes: list[str] = []
     paid: Optional[float] = None
@@ -434,9 +440,29 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
         if note:
             notes.append(note)
 
-    # The total must match what the receipt says was paid (payment lines − change), both printed.
+    # ── OCR witness on the total's page: confirms or contradicts the total and the currency ──
     total = fields["total_amount"]
-    if paid is not None and total["value"] is not None and abs(total["value"] - paid) > 0.005:
+    witnessed = False
+    if ocr is not None and doc_pages:
+        page = field_page["total_amount"]
+        try:
+            lines = [OcrLine(text, box) for text, box in await ocr(pages[page])]
+            ev = build_evidence(lines, page)
+            read_values = [r.value for r in readings["total_amount"] if r.value is not None]
+            if ev.has_amounts:
+                note = apply_total_witness(total, read_values, ev)
+                if note:
+                    notes.append(note)
+                witnessed = True  # else (TOTAL and payment unreadable for OCR) keep the check below
+            note = apply_currency_witness(fields["currency"], ev)
+            if note:
+                notes.append(note)
+        except Exception as e:  # noqa: BLE001 - OCR trouble must not lose the model's reads
+            logger.warning("OCR witness failed: %s", e)
+            notes.append("OCR witness unavailable")
+
+    # Without OCR, the payment read by the model is the only cross-check of the total.
+    if not witnessed and paid is not None and total["value"] is not None and abs(total["value"] - paid) > 0.005:
         total["confidence"] = "low"
         notes.append(f"total_amount: the total read ({total['value']:.2f}) differs from the payment "
                      f"printed on the receipt minus change ({paid:.2f})")

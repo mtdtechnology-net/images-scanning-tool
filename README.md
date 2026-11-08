@@ -14,7 +14,7 @@ upload → PDF/image → page images ─┬─ preprocess (CPU) → PaddleOCR (G
 ```
 
 - **Endpoints:** `POST /api/report-stream` (mobile: first expense) and `POST /api/web-report-stream` (web: aggregated trip). Both return `text/event-stream`.
-- **Verifier:** `POST /api/verify-receipt` re-reads a submitted receipt in the background, image only, and returns plain JSON. See [Receipt verifier](#-receipt-verifier-post-apiverify-receipt).
+- **Verifier:** `POST /api/verify-receipt` re-reads a submitted receipt in the background (vision model reading the image blind, OCR as an independent witness) and returns plain JSON. See [Receipt verifier](#-receipt-verifier-post-apiverify-receipt).
 - **Pipelining:** pages of a request run concurrently. OCR is serialized on a single PaddleOCR instance; LLM calls are capped by `LLM_CONCURRENCY` across *all* requests. While one page is in the LLM, the next is in OCR.
 - **Warm-up:** on startup the OCR model and the Ollama model are loaded, so the first request isn't slow.
 - **Structured output:** the LLM is constrained to the JSON schema of `LLMExtraction` (`core/state.py`).
@@ -94,9 +94,10 @@ Swagger UI: `http://localhost:8000/docs`
 ## 🔎 Receipt verifier (`POST /api/verify-receipt`)
 
 Step ④ of the Spendle flow. After the employee submits a report, the Spendle backend queues
-each receipt and calls this endpoint in the background. It reads the receipt **from the image
-only**: no PaddleOCR, no OCR text, and never the values the employee declared. It reports what
-is printed and how sure it is. The comparison with the declared values (steps ⑤–⑥) happens in
+each receipt and calls this endpoint in the background. A vision model reads the receipt **from the
+image only**: it never gets OCR text and never the values the employee declared. PaddleOCR runs
+separately as an **independent witness** for the total and the currency. It reports what is
+printed and how sure it is. The comparison with the declared values (steps ⑤–⑥) happens in
 the Spendle backend with plain rules. The verifier never approves or judges anything.
 
 ### Contract
@@ -158,10 +159,25 @@ Confidence is measured from agreement, never self-reported:
 | `medium` | they agree but there is no usable box, a read did not find the value, or they differ only in formatting (`F-0042` vs `F42`) |
 | `low` | they disagree, or only one read found the value. The majority value is returned and `notes` lists every read. |
 
-**Total vs payment.** Read B also lists the payment lines (CARD, NUMERAR/CASH) and the change (REST).
-If the total that was read differs from *payment − change*, both printed on the receipt, the total
-gets `low` and the status becomes `unreadable`. This catches a faded last digit that every read
-gets wrong the same way (e.g. `TOTAL LEI 245.1` next to `CARD 245.18`).
+**OCR witness (total and currency).** `VERIFY_OCR_WITNESS=true` (default). PaddleOCR reads the
+total's page once, as it is (no crop, so its boxes are page pixels), on the instance the live scans
+use (~1–2 s on GPU). The model never sees this text. Plain code finds the **TOTAL row** (not
+SUBTOTAL / TOTAL TVA / TAXE; `TVA` OCR'd as `TUA` included), the **payment rows** (CARD, NUMERAR,
+CASH, CARTE CREDIT) minus **REST**, and the **currency on the TOTAL row** ("TOTAL LEI"). Only amounts
+with two decimals count, so card numbers and codes never match.
+
+| Model total vs OCR | Result |
+|---|---|
+| OCR reads the same amount on the TOTAL row | `high`, with OCR's exact box. A payment line that disagrees only lowers it to `medium` with a note (payment lines get misread too). |
+| A minority model read equals OCR's TOTAL row **and** the payment | that value, `medium`, with a note |
+| OCR reads a different amount on the TOTAL row | `low` → status `unreadable` |
+| OCR has no TOTAL row, payment matches / differs | payment decides: `medium` / `low` |
+| OCR finds neither TOTAL nor payment (faded receipt) | fallback: the model's own read of the payment lines (read B); a different *payment − change* makes the total `low` |
+
+Currency: confirmed by the currency on the TOTAL row → `high` with its box; the model found none but
+the TOTAL row prints one → filled in, `medium`; different currencies → `low`. A currency found
+anywhere else on the page is ignored. On the 10 benchmark receipts, real PaddleOCR found the right
+TOTAL and payment on 9 (the 10th is the faded one) and "LEI" on every Rompetrol receipt.
 
 **Boxes need two reads.** A box is returned only when two reads (e.g. A and B) put it on the same
 spot (≥30% overlap). On the first benchmark about a third of the single-read boxes were on the wrong
@@ -194,7 +210,7 @@ Boxes come from the models' grounding:
   - afterwards the verifier models are unloaded and the live-scan model is reloaded with its own `num_ctx`.
   Swapped models stay in the RAM page cache, so a reload takes seconds.
 - **Preemption:** if a scan starts mid-verification, the verifier's Ollama call is cancelled at once, the live-scan model is reloaded and the answer is `error` ("preempted"). A scan waits at most for that reload, never for a verification.
-- No OCR and no OpenCV run on this path. The CPU work is one PDF render (at `VERIFY_PDF_SCALE`) and a few image resizes.
+- CPU work on this path: one PDF render (at `VERIFY_PDF_SCALE`), a few image resizes, and the host side of one OCR pass (no OpenCV preprocessing). The OCR pass shares the live scans' PaddleOCR lock; a scan arriving meanwhile waits for it (~1–2 s).
 - Single-process assumption: the scan tracking lives in memory, so keep one uvicorn worker (already required for OCR).
 
 ### Ollama models to pull
@@ -227,6 +243,7 @@ Check the exact tags in the Ollama library before pulling. Qwen VL models above 
 | `VERIFY_TOTAL_TIMEOUT` | `1200` | Seconds per receipt. |
 | `VERIFY_WAIT_IDLE_TIMEOUT` | `60` | Seconds to wait for live scans to end before answering `error`. |
 | `VERIFY_IDLE_GRACE_S` | `10` | Quiet seconds after the last scan before a verification starts. |
+| `VERIFY_OCR_WITNESS` | `true` | Run PaddleOCR once on the total's page as an independent witness for the total and the currency (exact boxes). |
 
 ### VRAM budget (16 GB RTX 5060 Ti)
 

@@ -19,6 +19,7 @@ import base64
 import io
 import logging
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 import numpy as np
@@ -45,6 +46,9 @@ def _get_ocr():
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
+            # oneDNN on CPU crashes with the Linux paddlepaddle-gpu build
+            # ("ConvertPirAttribute2RuntimeAttribute not support"); it is only used on CPU.
+            enable_mkldnn=not (OCR_DEVICE == "cpu" and sys.platform == "linux"),
         )
         logger.info("PaddleOCR loaded (lang=%s, device=%s)", OCR_LANG, OCR_DEVICE)
     return _ocr_instance
@@ -130,6 +134,29 @@ async def run_ocr(img_b64: str, doc_index: int, total_docs: int, on_start=None) 
 
     page_text = "\n".join(lines_text)
     return f"--- Document {doc_index + 1} / {total_docs} ---\n{page_text}"
+
+
+def _ocr_lines(img_array: np.ndarray) -> list[tuple[str, list[int]]]:
+    """Run OCR and return (text, [x0, y0, x1, y1]) for every detected line."""
+    result = _get_ocr().predict(img_array)
+    if not result:
+        return []
+    res = result[0]
+    lines = []
+    for text, poly in zip(res["rec_texts"], res["rec_polys"]):
+        xs = [float(pt[0]) for pt in poly]
+        ys = [float(pt[1]) for pt in poly]
+        lines.append((text, [round(min(xs)), round(min(ys)), round(max(xs)), round(max(ys))]))
+    return lines
+
+
+async def ocr_page_lines(image: Image.Image) -> list[tuple[str, list[int]]]:
+    """OCR one page image as it is (no crop, warp or resize), so the line boxes are in the
+    page's own pixel coordinates. Used by the receipt verifier as an independent witness."""
+    loop = asyncio.get_running_loop()
+    img_array = await asyncio.to_thread(lambda: np.array(image.convert("RGB"))[:, :, ::-1].copy())
+    async with _ocr_lock:
+        return await loop.run_in_executor(_ocr_executor, _ocr_lines, img_array)
 
 
 async def warmup_ocr() -> None:

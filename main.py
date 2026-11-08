@@ -17,14 +17,14 @@ from ollama import AsyncClient
 from core.config import (
     CORS_ORIGINS, LLM_CONCURRENCY, LLM_IMAGE_MAX_SIDE, MAX_FILE_SIZE, MAX_PAGES,
     OLLAMA_BASE_URL, OLLAMA_KEEP_ALIVE, OLLAMA_MODEL, OLLAMA_NUM_CTX,
-    VERIFY_IDLE_GRACE_S, VERIFY_MODEL, VERIFY_PDF_SCALE, VERIFY_SECOND_MODEL,
+    VERIFY_IDLE_GRACE_S, VERIFY_MODEL, VERIFY_OCR_WITNESS, VERIFY_PDF_SCALE, VERIFY_SECOND_MODEL,
     VERIFY_TOTAL_TIMEOUT, VERIFY_WAIT_IDLE_TIMEOUT,
 )
 from core.gpu_gate import GpuBusy, Preempted, live_scans, verify_semaphore
 from graph.nodes import INVALID_DOC_ERROR, run_extraction_hybrid, aggregate_web_expenses
 from graph.verifier import error_response, verify_pages
 from graph.verifier_ollama import OllamaBackend, VerifierError
-from graph.ocr_worker import run_ocr, warmup_ocr
+from graph.ocr_worker import ocr_page_lines, run_ocr, warmup_ocr
 from tools.parser import downscale_base64, parse_document_to_images
 
 logging.basicConfig(
@@ -367,7 +367,8 @@ def _verify_error(notes: str, pages: list[dict] | None = None, duration_ms: int 
 
 async def _run_verification(backend: OllamaBackend, images: list[str]):
     await backend.begin()
-    return await verify_pages(images, backend, VERIFY_MODEL, VERIFY_SECOND_MODEL or None)
+    return await verify_pages(images, backend, VERIFY_MODEL, VERIFY_SECOND_MODEL or None,
+                              ocr=ocr_page_lines if VERIFY_OCR_WITNESS else None)
 
 
 @app.post("/api/verify-receipt")
