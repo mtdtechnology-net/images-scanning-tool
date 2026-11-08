@@ -467,6 +467,17 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
         notes.append(f"total_amount: the total read ({total['value']:.2f}) differs from the payment "
                      f"printed on the receipt minus change ({paid:.2f})")
 
+    # A total needs at least one independent confirmation. Read C zooms where read A pointed,
+    # so A + C alone is one look at the same spot. On a degraded receipt where read B fails and
+    # OCR finds neither the TOTAL row nor a payment, "I can't tell" is the right answer.
+    if total["value"] is not None and total["confidence"] in ("high", "medium") and not witnessed:
+        independent = any(r.source in ("B", "D") and r.value is not None and abs(r.value - total["value"]) < 0.005
+                          for r in readings["total_amount"])
+        if not independent and not (paid is not None and abs(paid - total["value"]) < 0.005):
+            total["confidence"] = "low"
+            notes.append("total_amount: no independent confirmation (only the full-page read and its "
+                         "zoom); the receipt is too degraded to cross-check")
+
     # ── Status ──
     status = "ok"
     a_types = [r.document_type for r in a_reads]

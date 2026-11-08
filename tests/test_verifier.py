@@ -416,3 +416,28 @@ def test_faded_total_contradicted_by_payment_is_unreadable():
     assert resp["status"] == "unreadable"
     assert resp["fields"]["total_amount"]["confidence"] == "low"
     assert "245.18" in resp["notes"]
+
+
+def test_degraded_receipt_without_independent_confirmation_is_unreadable():
+    """pag1 on the server: read B ran out of tokens, OCR read nothing, A and its zoom C
+    agreed on the faded "245.1". That is one look at one spot: the answer is "can't tell"."""
+    async def blind_ocr(image):
+        return []
+
+    full = full_page(total="245.1")
+    backend = FakeBackend(full, full, fail={(PRIMARY, "lines")},
+                          zoom={"total_amount": "245.1", "currency": "LEI", "receipt_date": "03.11.2026",
+                                "document_number": "F-0042"})
+    resp = asyncio.run(verify_pages([_page_b64()], backend, PRIMARY, None, max_side=1792, ocr=blind_ocr)).response
+    assert resp["status"] == "unreadable"
+    assert resp["fields"]["total_amount"]["confidence"] == "low"
+    assert "no independent confirmation" in resp["notes"]
+
+
+def test_read_b_failure_is_fine_when_ocr_confirms():
+    async def ocr(image):
+        return [("TOTAL:", [230, 1880, 360, 1932]), ("120,00", [412, 1880, 590, 1932])]
+
+    backend = FakeBackend(full_page(), full_page(), fail={(PRIMARY, "lines")})
+    resp = asyncio.run(verify_pages([_page_b64()], backend, PRIMARY, None, max_side=1792, ocr=ocr)).response
+    assert resp["status"] == "ok" and resp["fields"]["total_amount"]["confidence"] == "high"
