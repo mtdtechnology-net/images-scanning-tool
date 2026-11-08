@@ -173,6 +173,7 @@ with two decimals count, so card numbers and codes never match.
 | OCR reads a different amount on the TOTAL row | `low` → status `unreadable` |
 | OCR has no TOTAL row, payment matches / differs | payment decides: `medium` / `low` |
 | OCR finds neither TOTAL nor payment (faded receipt) | fallback: the model's own read of the payment lines (read B); a different *payment − change* makes the total `low` |
+| Nothing independent confirms the total (read B failed, OCR found nothing, no matching payment) | `low` → `unreadable`: reads A and C look at the same spot, so they count as one |
 
 Currency: confirmed by the currency on the TOTAL row → `high` with its box; the model found none but
 the TOTAL row prints one → filled in, `medium`; different currencies → `low`. A currency found
