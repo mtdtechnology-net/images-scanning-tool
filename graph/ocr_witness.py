@@ -7,6 +7,9 @@ same page, and its lines are used only to confirm or contradict what the model r
 - what was paid (CARD / NUMERAR / CASH rows minus REST),
 - the currency printed on the TOTAL row.
 
+When those label rules find nothing (unknown layout or language), a location witness reads the
+OCR text inside the model's box for the total: no keywords, any layout.
+
 Two technologies that fail differently (a vision model that may "see" a 0 as an 8 or invent a
 plausible digit, an OCR engine that copies characters) agreeing is much stronger evidence
 than several reads of the same model. OCR also gives exact boxes for the manager's highlight.
@@ -244,6 +247,51 @@ def apply_total_witness(fld: dict, read_values: list[float], ev: OcrEvidence) ->
         fld["confidence"] = "low"
         return f"total_amount: the model read {value:.2f}, payment minus change (OCR) is {ev.paid:.2f}"
     return None
+
+
+def _intersection(a: list[int], b: list[float]) -> float:
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    return w * h if w > 0 and h > 0 else 0.0
+
+
+def _area(b: list[int]) -> float:
+    return max(1, b[2] - b[0]) * max(1, b[3] - b[1])
+
+
+def apply_location_witness(fld: dict, boxes: list[list[int]], lines: list[OcrLine],
+                           page: int) -> tuple[bool, Optional[str]]:
+    """Layout-free witness: OCR reads the text where the model says the total is printed.
+
+    Used when the label rules above find nothing (an unknown layout or language: "Gesamtbetrag",
+    "Amount due", a total in a table column). It needs no keywords, only the model's box.
+    It proves the model read the digits right, not that it picked the right line (it would
+    confirm a subtotal too), so it never raises the confidence: it only counts as the
+    independent confirmation a total needs. Returns (OCR judged the total, note)."""
+    value = fld["value"]
+    if not isinstance(value, float) or not boxes:
+        return False, None
+    seen: list[float] = []
+    for box in boxes:
+        w, h = box[2] - box[0], box[3] - box[1]
+        # Model boxes are loose: look a little around them.
+        grown = [box[0] - 0.15 * w - 5, box[1] - 0.5 * h - 5, box[2] + 0.15 * w + 5, box[3] + 0.5 * h + 5]
+        for line in lines:
+            if not _intersection(line.bbox, grown):
+                continue
+            amounts = [a for a in map(normalize_amount, _MONEY_RE.findall(line.text)) if a is not None]
+            if any(_eq(a, value) for a in amounts):
+                if fld["bbox"] is None:  # an exact box for the manager's highlight
+                    fld.update(page=page + 1, bbox=line.bbox)
+                return True, None
+            if _intersection(line.bbox, box) >= 0.5 * _area(line.bbox):
+                seen.extend(amounts)
+    if seen:
+        # OCR reads another amount right where the model read its total: a misread digit.
+        fld["confidence"] = "low"
+        return True, (f"total_amount: the model read {value:.2f}, OCR reads "
+                      f"{', '.join(f'{a:.2f}' for a in dict.fromkeys(seen))} at the same place")
+    return False, None
 
 
 def apply_currency_witness(fld: dict, ev: OcrEvidence) -> Optional[str]:

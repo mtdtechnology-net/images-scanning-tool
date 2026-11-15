@@ -29,7 +29,9 @@ from PIL import Image
 
 from core.config import VERIFY_IMAGE_MAX_SIDE, VERIFY_QWEN25_MAX_PIXELS, VERIFY_READ_RETRIES
 from graph.normalize import FIELDS, NORMALIZERS, loose_key, normalize_amount
-from graph.ocr_witness import OcrLine, apply_currency_witness, apply_total_witness, build_evidence
+from graph.ocr_witness import (
+    OcrLine, apply_currency_witness, apply_location_witness, apply_total_witness, build_evidence,
+)
 from graph.verifier_ollama import VerifierError
 from prompts.verify import (
     AMOUNT_LINES_PROMPT, AMOUNT_LINES_SCHEMA, FULL_PAGE_PROMPT, FULL_PAGE_SCHEMA,
@@ -442,24 +444,36 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
 
     # ── OCR witness on the total's page: confirms or contradicts the total and the currency ──
     total = fields["total_amount"]
-    witnessed = False
+    witnessed = False   # the label rules (TOTAL row, payment) judged the total
+    located = False     # OCR read the total where the model located it (any layout)
+    ocr_log = "off"
     if ocr is not None and doc_pages:
         page = field_page["total_amount"]
         try:
             lines = [OcrLine(text, box) for text, box in await ocr(pages[page])]
             ev = build_evidence(lines, page)
+            ocr_log = (f"{len(lines)} lines, TOTAL rows={[f.value for f in ev.totals]}, paid={ev.paid}, "
+                       f"currencies={[f.value for f in ev.currencies]}")
             read_values = [r.value for r in readings["total_amount"] if r.value is not None]
             if ev.has_amounts:
                 note = apply_total_witness(total, read_values, ev)
                 if note:
                     notes.append(note)
                 witnessed = True  # else (TOTAL and payment unreadable for OCR) keep the check below
+            elif total["value"] is not None:
+                boxes = [r.bbox for r in readings["total_amount"]
+                         if r.bbox and r.page == page and r.value is not None
+                         and abs(r.value - total["value"]) < 0.005]
+                located, note = apply_location_witness(total, boxes, lines, page)
+                if note:
+                    notes.append(note)
             note = apply_currency_witness(fields["currency"], ev)
             if note:
                 notes.append(note)
         except Exception as e:  # noqa: BLE001 - OCR trouble must not lose the model's reads
             logger.warning("OCR witness failed: %s", e)
             notes.append("OCR witness unavailable")
+            ocr_log = "failed"
 
     # Without OCR, the payment read by the model is the only cross-check of the total.
     if not witnessed and paid is not None and total["value"] is not None and abs(total["value"] - paid) > 0.005:
@@ -469,8 +483,10 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
 
     # A total needs at least one independent confirmation. Read C zooms where read A pointed,
     # so A + C alone is one look at the same spot. On a degraded receipt where read B fails and
-    # OCR finds neither the TOTAL row nor a payment, "I can't tell" is the right answer.
-    if total["value"] is not None and total["confidence"] in ("high", "medium") and not witnessed:
+    # OCR reads neither the TOTAL row, a payment, nor the digits where the model saw the total,
+    # "I can't tell" is the right answer.
+    if (total["value"] is not None and total["confidence"] in ("high", "medium")
+            and not witnessed and not located):
         independent = any(r.source in ("B", "D") and r.value is not None and abs(r.value - total["value"]) < 0.005
                           for r in readings["total_amount"])
         if not independent and not (paid is not None and abs(paid - total["value"]) < 0.005):
@@ -508,6 +524,15 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
         totals = {a_reads[i].fields["total_amount"].value for i in doc_pages} - {None}
         if len(totals) > 1 and status == "ok":
             notes.append(f"pages show different totals; using page {field_page['total_amount'] + 1}")
+
+    # The same kind of data the live scan already logs (amount, currency, date): no other content.
+    reads = lambda fld: " ".join(f"{r.source}={_fmt(r.value)}" for r in readings[fld])  # noqa: E731
+    logger.info("Verifier result: status=%s | total %s -> %s (%s)%s | currency %s -> %s (%s) | "
+                "date %s -> %s (%s) | model payment=%s | OCR: %s",
+                status, reads("total_amount"), _fmt(total["value"]), total["confidence"],
+                " located by OCR" if located else "", reads("currency"), fields["currency"]["value"],
+                fields["currency"]["confidence"], reads("receipt_date"), fields["receipt_date"]["value"],
+                fields["receipt_date"]["confidence"], _fmt(paid), ocr_log)
 
     response = {
         "status": status,
