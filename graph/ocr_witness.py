@@ -123,19 +123,54 @@ def _currencies(row: list[OcrLine]) -> list[Found]:
     return found
 
 
+def _only_money(row: list[OcrLine]) -> bool:
+    """A row with nothing but an amount and maybe a currency ("1239.25 RON")."""
+    text = _plain(" ".join(l.text for l in row))
+    if not _MONEY_RE.search(text):
+        return False
+    rest = _MONEY_RE.sub(" ", text)
+    words = re.findall(r"[A-Z]+", rest)
+    return all(w in _CURRENCY_WORDS for w in words) and not re.search(r"\d", rest)
+
+
+def _value_below(rows: list[list[OcrLine]], i: int) -> Optional[list[OcrLine]]:
+    """Invoices often print the amount under the label, in the same box:
+        Total de plata
+        1239.25 RON
+    Returns the row right below a TOTAL label (close, overlapping it horizontally) when that row
+    holds only an amount. Only the first such row counts: a second one is usually a conversion
+    ("231.88 EUR")."""
+    label = next(l for l in rows[i] if _TOTAL_RE.search(_plain(l.text)))
+    if i + 1 >= len(rows):
+        return None
+    below = rows[i + 1]
+    if below[0].yc - label.yc > 2.5 * label.height:
+        return None
+    width = label.bbox[2] - label.bbox[0]
+    lo, hi = label.bbox[0] - width, label.bbox[2] + width
+    near = [l for l in below if l.bbox[2] > lo and l.bbox[0] < hi]
+    return near if near and _only_money(near) else None
+
+
 def build_evidence(lines: list[OcrLine], page: int) -> OcrEvidence:
     ev = OcrEvidence(page)
     payments: set[float] = set()
     change = 0.0
-    for row in group_rows(lines):
+    rows = group_rows(lines)
+    for i, row in enumerate(rows):
         kind = row_kind(" ".join(l.text for l in row))
         if kind is None:
             continue
         money = _rightmost_money(row)
         if kind == "total":
+            value_row = row
+            if money is None:
+                below = _value_below(rows, i)
+                if below:
+                    money, value_row = _rightmost_money(below), below
             if money:
                 ev.totals.append(money)
-            ev.currencies.extend(_currencies(row))
+            ev.currencies.extend(_currencies(row) + (_currencies(value_row) if value_row is not row else []))
         elif money and kind == "payment":
             payments.add(money.value)  # the same card payment is often printed twice
         elif money and kind == "change":
