@@ -183,3 +183,33 @@ def test_ocr_without_amounts_falls_back_to_the_models_payment_check():
                                 "document_number": "F-0042"})
     resp = asyncio.run(verify_pages([_page_b64()], backend, PRIMARY, SECOND, max_side=1792, ocr=blind_ocr)).response
     assert resp["status"] == "unreadable" and "245.18" in resp["notes"]
+
+
+# Hotel invoice: the amount is printed under "Total de plata", then converted to EUR.
+INVOICE = [
+    L("Modalitate plata: Card", 251, 1122),
+    L("Curs valutar 1 EUR = 5.3443 RON", 251, 1141),
+    L("Semnatura si stampila furnizorului", 255, 1296), L("Semnatura de", 900, 1296),
+    L("1120.41", 1113, 1296, 1190, 1316), L("118.84", 1270, 1296, 1330, 1316),
+    L("primire", 900, 1315, 980, 1335), L("Total de plata", 1230, 1315, 1370, 1335),
+    L("1239.25 RON", 1232, 1337, 1368, 1357),
+    L("231.88 EUR", 1245, 1358, 1355, 1378),
+    L("NET", 405, 1391, 440, 1411), L("TVA", 535, 1391, 570, 1411), L("TOTAL", 705, 1391, 765, 1411),
+    L("11.00%", 255, 1432, 320, 1452), L("1080.41", 370, 1432, 450, 1452),
+    L("118.84", 520, 1432, 585, 1452), L("1199.25", 700, 1432, 770, 1452),
+]
+
+
+def test_amount_printed_under_the_total_label():
+    ev = build_evidence(INVOICE, 0)
+    assert [f.value for f in ev.totals] == [1239.25]       # not the EUR conversion, not 1199.25
+    assert [f.value for f in ev.currencies] == ["RON"]
+    assert ev.paid is None                                 # "Card" without an amount
+    fld = field(1239.25, "medium")
+    assert apply_total_witness(fld, [1239.25, 1239.25], ev) is None
+    assert fld["confidence"] == "high" and fld["bbox"] == [1232, 1337, 1368, 1357]
+
+
+def test_text_under_the_total_label_is_not_an_amount():
+    lines = [L("TOTAL", 300, 500, 400, 530), L("Va multumim 12.50", 300, 535, 600, 565)]
+    assert build_evidence(lines, 0).totals == []
