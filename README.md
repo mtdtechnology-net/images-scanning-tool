@@ -163,8 +163,16 @@ Confidence is measured from agreement, never self-reported:
 total's page once, as it is (no crop, so its boxes are page pixels), on the instance the live scans
 use (~1–2 s on GPU). The model never sees this text. Plain code finds the **TOTAL row** (not
 SUBTOTAL / TOTAL TVA / TAXE; `TVA` OCR'd as `TUA` included), the **payment rows** (CARD, NUMERAR,
-CASH, CARTE CREDIT) minus **REST**, and the **currency on the TOTAL row** ("TOTAL LEI"). Only amounts
-with two decimals count, so card numbers and codes never match.
+CASH, CARTE CREDIT) minus **REST**, and the **currency on the TOTAL row** ("TOTAL LEI"). The amount
+may sit on the label's row or, as on invoices, on the row right below it ("Total de plata" /
+"1239.25 RON"; a second row below, usually a conversion, is ignored). Only amounts with two
+decimals count, so card numbers and codes never match.
+
+When these label rules find nothing (an unknown layout or language: "Gesamtbetrag", "Amount due",
+a total in a table column), a **location witness** takes over: OCR reads the text inside the box
+where the model located the total. It needs no keywords, so it works on any layout. It proves the
+digits, not that the model picked the right line (it would confirm a subtotal too), so it never
+raises the confidence; it only counts as the total's independent confirmation.
 
 | Model total vs OCR | Result |
 |---|---|
@@ -172,8 +180,10 @@ with two decimals count, so card numbers and codes never match.
 | A minority model read equals OCR's TOTAL row **and** the payment | that value, `medium`, with a note |
 | OCR reads a different amount on the TOTAL row | `low` → status `unreadable` |
 | OCR has no TOTAL row, payment matches / differs | payment decides: `medium` / `low` |
+| No TOTAL row or payment for OCR; OCR reads the same amount where the model located the total | confidence unchanged (at most what the model reads give), counts as the independent confirmation, OCR's exact box |
+| No TOTAL row or payment for OCR; OCR reads another amount where the model located the total | `low` → `unreadable` (a misread digit) |
 | OCR finds neither TOTAL nor payment (faded receipt) | fallback: the model's own read of the payment lines (read B); a different *payment − change* makes the total `low` |
-| Nothing independent confirms the total (read B failed, OCR found nothing, no matching payment) | `low` → `unreadable`: reads A and C look at the same spot, so they count as one |
+| Nothing independent confirms the total (read B failed, OCR found nothing at the TOTAL row, the payment or the model's box, no matching payment) | `low` → `unreadable`: reads A and C look at the same spot, so they count as one |
 
 Currency: confirmed by the currency on the TOTAL row → `high` with its box; the model found none but
 the TOTAL row prints one → filled in, `medium`; different currencies → `low`. A currency found

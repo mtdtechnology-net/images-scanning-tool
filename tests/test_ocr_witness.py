@@ -5,7 +5,8 @@ import asyncio
 import pytest
 
 from graph.ocr_witness import (
-    OcrLine, apply_currency_witness, apply_total_witness, build_evidence, group_rows, row_kind,
+    OcrLine, apply_currency_witness, apply_location_witness, apply_total_witness, build_evidence,
+    group_rows, row_kind,
 )
 from tests.test_verifier import FakeBackend, full_page, run as run_verifier  # noqa: F401
 
@@ -213,3 +214,58 @@ def test_amount_printed_under_the_total_label():
 def test_text_under_the_total_label_is_not_an_amount():
     lines = [L("TOTAL", 300, 500, 400, 530), L("Va multumim 12.50", 300, 535, 600, 565)]
     assert build_evidence(lines, 0).totals == []
+
+
+# ─── Location witness: OCR reads the text where the model located the total ──
+
+AT_TOTAL = [412, 1880, 590, 1932]   # where full_page() puts the total
+
+
+def test_location_confirms_the_digits_and_gives_an_exact_box():
+    fld = field(1239.25, "medium")
+    lines = [L("Gesamtbetrag", 1000, 1300, 1200, 1330), L("1.239,25 EUR", 1230, 1338, 1370, 1358)]
+    assert apply_location_witness(fld, [[1220, 1330, 1380, 1365]], lines, 0) == (True, None)
+    assert fld["confidence"] == "medium"                     # never raised: it may be a subtotal
+    assert fld["bbox"] == [1230, 1338, 1370, 1358] and fld["page"] == 1
+
+
+def test_location_contradicts_a_misread_digit():
+    fld = field(1289.25, "medium")
+    lines = [L("1239.25 RON", 1232, 1337, 1368, 1357)]
+    judged, note = apply_location_witness(fld, [[1225, 1332, 1375, 1362]], lines, 0)
+    assert judged and fld["confidence"] == "low" and "1239.25" in note
+
+
+def test_location_without_ocr_text_there_judges_nothing():
+    fld = field(1239.25, "medium")
+    lines = [L("Hotel Sibiu", 100, 100, 400, 130), L("40.00", 700, 700, 770, 720)]
+    assert apply_location_witness(fld, [[1225, 1332, 1375, 1362]], lines, 0) == (False, None)
+    assert fld["confidence"] == "medium"
+
+
+def test_unknown_layout_confirmed_by_location():
+    """No TOTAL keyword OCR knows ("Gesamtbetrag") and read B fails: before, the total had no
+    independent confirmation and the invoice came back unreadable."""
+    from graph.verifier import verify_pages
+    from tests.test_verifier import PRIMARY, _page_b64
+
+    async def ocr(image):
+        return [("Gesamtbetrag", [200, 1880, 380, 1932]), ("120,00", AT_TOTAL)]
+
+    backend = FakeBackend(full_page(), full_page(), fail={(PRIMARY, "lines")})
+    resp = asyncio.run(verify_pages([_page_b64()], backend, PRIMARY, None, max_side=1792, ocr=ocr)).response
+    assert resp["status"] == "ok"
+    assert resp["fields"]["total_amount"]["confidence"] == "medium"
+    assert resp["fields"]["total_amount"]["bbox"] == AT_TOTAL
+
+
+def test_unknown_layout_with_misread_total_is_unreadable():
+    from graph.verifier import verify_pages
+    from tests.test_verifier import PRIMARY, _page_b64
+
+    async def ocr(image):
+        return [("Gesamtbetrag", [200, 1880, 380, 1932]), ("128,00", AT_TOTAL)]
+
+    backend = FakeBackend(full_page(), full_page(), fail={(PRIMARY, "lines")})
+    resp = asyncio.run(verify_pages([_page_b64()], backend, PRIMARY, None, max_side=1792, ocr=ocr)).response
+    assert resp["status"] == "unreadable" and "128.00" in resp["notes"]
