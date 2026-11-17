@@ -7,17 +7,23 @@ same page, and its lines are used only to confirm or contradict what the model r
 - what was paid (CARD / NUMERAR / CASH rows minus REST),
 - the currency printed on the TOTAL row.
 
-When those label rules find nothing (unknown layout or language), a location witness reads the
-OCR text inside the model's box for the total: no keywords, any layout.
+When those label rules can't tell which row is the final total (several TOTAL rows with different
+amounts, or no keyword they know), the verifier may ask the model to label the OCR rows by meaning
+(`prompt_rows` / `evidence_from_labels`). The model returns row numbers and kinds only; the amounts
+still come from the OCR text, so it can't invent digits. Its choice of row is an AI judgment, so
+evidence built from it never raises a field to "high".
+
+When nothing works, a location witness reads the OCR text inside the model's box for the total:
+no keywords, any layout.
 
 Two technologies that fail differently (a vision model that may "see" a 0 as an 8 or invent a
 plausible digit, an OCR engine that copies characters) agreeing is much stronger evidence
 than several reads of the same model. OCR also gives exact boxes for the manager's highlight.
-Everything here is plain code on OCR output; no model is involved.
+Everything here is plain code on OCR output (and on the labeler's row kinds); no model is called.
 """
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from graph.normalize import normalize_amount
@@ -28,7 +34,9 @@ _MONEY_RE = re.compile(r"(?<![\d.,])\d{1,3}(?:[.,\s]\d{3})*[.,]\d{2}(?![\d.,])|(
 
 _TOTAL_RE = re.compile(r"\bTOTAL\b")
 # "TVA" is often OCR'd as "TUA" on thermal receipts ("TOTAL TUA BON 38.03").
-_NOT_TOTAL_RE = re.compile(r"SUBTOTAL|\bT[VU]A\b|\bTAX|\bFARA\b|\bNET\b|\bDISCOUNT|\bREDUCERE")
+# Totals without VAT: "Total HT", "Total netto", "Total excl. VAT", "Total exkl. MwSt", "imponibil".
+_NOT_TOTAL_RE = re.compile(r"SUBTOTAL|\bT[VU]A\b|\bTAX|\bFARA\b|\bNET\b|\bDISCOUNT|\bREDUCERE"
+                           r"|\bHT\b|\bNETTO\b|\bEXCL|\bEXKL|\bOHNE\b|\bIMPONIBIL")
 _CHANGE_RE = re.compile(r"\bREST\b|\bCHANGE\b")
 _PAYMENT_RE = re.compile(r"\bCARD\b|\bNUMERAR\b|\bCASH\b|\bCARTE\s+CREDIT\b|\bTICHET|\bVOUCHER\b")
 
@@ -66,6 +74,7 @@ class OcrEvidence:
     totals: list[Found] = field(default_factory=list)      # amounts on TOTAL rows
     paid: Optional[float] = None                # payment rows − change rows
     currencies: list[Found] = field(default_factory=list)  # currencies on TOTAL rows
+    labelled: bool = False                      # the TOTAL rows were picked by the AI labeler
 
     @property
     def has_amounts(self) -> bool:
@@ -183,6 +192,81 @@ def build_evidence(lines: list[OcrLine], page: int) -> OcrEvidence:
     return ev
 
 
+# ─── AI labeler: plain code around the model's row kinds ─────────────────────
+
+MAX_PROMPT_ROWS = 150
+
+
+def _distinct(found: list[Found]) -> list[float]:
+    return list(dict.fromkeys(round(f.value, 2) for f in found))
+
+
+def needs_labels(ev: OcrEvidence, lines: list[OcrLine]) -> bool:
+    """The label rules can't name one final total: different amounts on several TOTAL rows (that
+    no payment row settles), or no TOTAL row at all on a page that prints amounts."""
+    values = _distinct(ev.totals)
+    if len(values) == 1:
+        return False
+    if len(values) > 1:
+        return not any(_eq(v, ev.paid) for v in values)
+    return any(_MONEY_RE.search(l.text) for l in lines)
+
+
+def prompt_rows(lines: list[OcrLine]) -> tuple[list[list[OcrLine]], str]:
+    """The page's OCR rows, numbered, as the labeler sees them. A very long page keeps only the
+    rows with an amount and the row above each (where a label printed over its amount sits)."""
+    rows = group_rows(lines)
+    texts = [" ".join(l.text for l in row) for row in rows]
+    keep = list(range(len(rows)))
+    if len(rows) > MAX_PROMPT_ROWS:
+        money = [i for i, t in enumerate(texts) if _MONEY_RE.search(t)]
+        keep = sorted({j for i in money for j in (i - 1, i) if j >= 0})[-MAX_PROMPT_ROWS:]
+    return rows, "\n".join(f"[{i}] {texts[i][:200]}" for i in keep)
+
+
+def evidence_from_labels(rows: list[list[OcrLine]], labels: list, page: int) -> OcrEvidence:
+    """Evidence from the labeler's row kinds ({"row": i, "kind": ...}). The amounts are taken from
+    the OCR text of each row, never from the model. Rows out of range or given two kinds are ignored."""
+    kinds: dict[int, str] = {}
+    conflicting: set[int] = set()
+    for item in labels or []:
+        if not isinstance(item, dict):
+            continue
+        i, kind = item.get("row"), item.get("kind")
+        if isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < len(rows) or not isinstance(kind, str):
+            continue
+        if kinds.get(i, kind) != kind:
+            conflicting.add(i)
+        kinds[i] = kind
+
+    ev = OcrEvidence(page, labelled=True)
+    payments: set[float] = set()
+    change = 0.0
+    for i in sorted(kinds.keys() - conflicting):
+        kind, row = kinds[i], rows[i]
+        money, value_row = _rightmost_money(row), row
+        if money is None and kind == "total" and i + 1 < len(rows) and i + 1 not in kinds \
+                and _only_money(rows[i + 1]):
+            money, value_row = _rightmost_money(rows[i + 1]), rows[i + 1]  # amount under its label
+        if money is None:
+            continue
+        if kind == "total":
+            ev.totals.append(money)
+            ev.currencies.extend(_currencies(value_row) + (_currencies(row) if value_row is not row else []))
+        elif kind == "payment":
+            payments.add(money.value)
+        elif kind == "change":
+            change += money.value
+    if payments:
+        ev.paid = round(sum(payments) - change, 2)
+    return ev
+
+
+# ─── Applying the evidence ───────────────────────────────────────────────────
+
+LABELLED_NOTE = "total_amount: confirmed by OCR on the row the AI labeler picked as the final total"
+
+
 def _eq(a: Optional[float], b: Optional[float]) -> bool:
     return a is not None and b is not None and abs(a - b) < 0.005
 
@@ -198,10 +282,27 @@ def apply_total_witness(fld: dict, read_values: list[float], ev: OcrEvidence) ->
     """Confirm or contradict the total the vision model read. Updates `fld` in place
     (value, raw, confidence, page, bbox) and returns a note when it isn't a plain confirmation."""
     value = fld["value"]
+    values = _distinct(ev.totals)
+    if len(values) > 1:
+        # Several different amounts on TOTAL rows (before/after a discount, net and gross, a total
+        # and its conversion): OCR can't tell which one is final, and confirming whichever the
+        # model read would turn its mistake into "high". Only a matching payment settles it.
+        final = [f for f in ev.totals if _eq(f.value, ev.paid)]
+        if not final:
+            if value is not None:
+                fld["confidence"] = "low"
+            return (f"total_amount: several totals on the page ({', '.join(f'{v:.2f}' for v in values)}) "
+                    "and nothing tells which one is final")
+        ev = replace(ev, totals=final)
+
     on_total = _find(ev.totals, value) if value is not None else None
     paid_ok = ev.paid is None or _eq(ev.paid, value)
+    capped = False
 
     def take(found: Found, confidence: str) -> None:
+        nonlocal capped
+        if ev.labelled and confidence == "high":  # an AI picked the row: not "high"
+            confidence, capped = "medium", True
         fld.update(value=found.value, raw=found.raw, confidence=confidence, page=ev.page + 1, bbox=found.bbox)
 
     if on_total:
@@ -210,7 +311,9 @@ def apply_total_witness(fld: dict, read_values: list[float], ev: OcrEvidence) ->
         if paid_ok:
             take(Found(value, fld["raw"] or on_total.raw, on_total.bbox),
                  "high" if was in ("high", "medium") else "medium")
-            return "total_amount: model reads disagreed, confirmed by OCR" if was == "low" else None
+            if was == "low":
+                return "total_amount: model reads disagreed, confirmed by OCR"
+            return LABELLED_NOTE if capped else None
         # A different payment amount alone doesn't overturn that (payment lines get misread
         # too, e.g. a thermal "0" taken for an "8"): keep it, at medium, with a note.
         take(Found(value, fld["raw"] or on_total.raw, on_total.bbox), "medium")
@@ -300,13 +403,21 @@ def apply_currency_witness(fld: dict, ev: OcrEvidence) -> Optional[str]:
     if not ev.currencies:
         return None
     value = fld["value"]
+    codes = list(dict.fromkeys(f.value for f in ev.currencies))
+    if len(codes) > 1:
+        # A total and its conversion ("TOTAL EUR" / "TOTAL RON"): OCR can't tell which currency
+        # the document is in. "low" means Spendle doesn't compare it.
+        if value is not None:
+            fld["confidence"] = "low"
+            return f"currency: several currencies on the total rows ({', '.join(codes)})"
+        return None
     if value is None:
         f = ev.currencies[0]
         fld.update(value=f.value, raw=f.raw, confidence="medium", page=ev.page + 1, bbox=f.bbox)
         return "currency: found by OCR on the TOTAL row only"
     found = _find(ev.currencies, value)
     if found:
-        fld.update(confidence="high", page=ev.page + 1, bbox=found.bbox)
+        fld.update(confidence="medium" if ev.labelled else "high", page=ev.page + 1, bbox=found.bbox)
         return None
     fld["confidence"] = "low"
     return f"currency: the model read {value}, OCR reads {ev.currencies[0].value} on the TOTAL row"

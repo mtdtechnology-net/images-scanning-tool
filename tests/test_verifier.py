@@ -12,7 +12,7 @@ from graph.verifier import (
     scale_bbox, verify_pages,
 )
 from graph.verifier_ollama import VerifierError
-from prompts.verify import AMOUNT_LINES_SCHEMA, FULL_PAGE_SCHEMA, ZOOM_SCHEMA, ZOOM_TARGETS
+from prompts.verify import AMOUNT_LINES_SCHEMA, FULL_PAGE_SCHEMA, OCR_ROWS_SCHEMA, ZOOM_SCHEMA, ZOOM_TARGETS
 from tools.parser import image_to_base64
 
 PRIMARY = "qwen3-vl:8b-thinking-q8_0"   # relative 0-1000 boxes
@@ -201,14 +201,15 @@ def amount_lines(total="120,00", box=True) -> dict:
 
 
 class FakeBackend:
-    def __init__(self, primary_page, second_page, lines=None, zoom=None, fail=()):
+    def __init__(self, primary_page, second_page, lines=None, zoom=None, fail=(), labels=None):
         self.answers = {(PRIMARY, "full"): primary_page, (SECOND, "full"): second_page,
-                        (PRIMARY, "lines"): lines or amount_lines()}
+                        (PRIMARY, "lines"): lines or amount_lines(), (PRIMARY, "labels"): labels or {"rows": []}}
         self.zoom = zoom or {"total_amount": "120,00", "currency": "LEI",
                              "receipt_date": "03.11.2026", "document_number": "F-0042"}
         self.fail = set(fail)
         self.calls: list[tuple[str, str]] = []
         self.prompts: list[str] = []
+        self.images: list[Optional[str]] = []
         self.loaded: list[str] = []
 
     async def load(self, model):
@@ -218,9 +219,11 @@ class FakeBackend:
         self.loaded.remove(model)
 
     async def chat(self, model, prompt, image_b64, schema):
-        kind = {id(FULL_PAGE_SCHEMA): "full", id(AMOUNT_LINES_SCHEMA): "lines", id(ZOOM_SCHEMA): "zoom"}[id(schema)]
+        kind = {id(FULL_PAGE_SCHEMA): "full", id(AMOUNT_LINES_SCHEMA): "lines", id(ZOOM_SCHEMA): "zoom",
+                id(OCR_ROWS_SCHEMA): "labels"}[id(schema)]
         self.calls.append((model, kind))
         self.prompts.append(prompt)
+        self.images.append(image_b64)
         if (model, kind) in self.fail:
             raise VerifierError("boom")
         if kind == "zoom":

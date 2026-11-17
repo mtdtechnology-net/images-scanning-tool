@@ -119,8 +119,9 @@ class OllamaBackend:
             except Exception:
                 logger.exception("Could not reload the live-scan model %s", self.scanner_model)
 
-    async def chat(self, model: str, prompt: str, image_b64: str, schema: dict) -> str:
-        """One structured call with one image. Returns the raw message content."""
+    async def chat(self, model: str, prompt: str, image_b64: Optional[str], schema: dict) -> str:
+        """One structured call with one image (or text only when `image_b64` is None).
+        Returns the raw message content."""
         thinking = self._thinking.get(model, False)
         options = {"num_ctx": self.num_ctx, "num_predict": self.num_predict}
         if thinking:
@@ -130,7 +131,7 @@ class OllamaBackend:
         try:
             resp = await self.client.chat(
                 model=model,
-                messages=[{"role": "user", "content": prompt, "images": [image_b64]}],
+                messages=[{"role": "user", "content": prompt, **({"images": [image_b64]} if image_b64 else {})}],
                 format=schema,
                 options=options,
                 keep_alive=self.keep_alive,

@@ -5,8 +5,8 @@ import asyncio
 import pytest
 
 from graph.ocr_witness import (
-    OcrLine, apply_currency_witness, apply_location_witness, apply_total_witness, build_evidence,
-    group_rows, row_kind,
+    LABELLED_NOTE, OcrLine, apply_currency_witness, apply_location_witness, apply_total_witness,
+    build_evidence, evidence_from_labels, group_rows, needs_labels, prompt_rows, row_kind,
 )
 from tests.test_verifier import FakeBackend, full_page, run as run_verifier  # noqa: F401
 
@@ -269,3 +269,174 @@ def test_unknown_layout_with_misread_total_is_unreadable():
     backend = FakeBackend(full_page(), full_page(), fail={(PRIMARY, "lines")})
     resp = asyncio.run(verify_pages([_page_b64()], backend, PRIMARY, None, max_side=1792, ocr=ocr)).response
     assert resp["status"] == "unreadable" and "128.00" in resp["notes"]
+
+
+# ─── Several TOTAL rows: OCR alone can't tell which is final ─────────────────
+
+# Romanian invoice with a discount: the final total is the second TOTAL row.
+DISCOUNT = [
+    L("Total", 230, 1800, 330, 1830), L("120,00", 412, 1800, 590, 1830),
+    L("Reducere 10%", 230, 1840, 400, 1870), L("-20,00", 412, 1840, 590, 1870),
+    L("Total de plata", 230, 1880, 400, 1932), L("100,00", 412, 1880, 590, 1932),
+]
+DISCOUNT_LABELS = [{"row": 0, "kind": "subtotal"}, {"row": 1, "kind": "discount"}, {"row": 2, "kind": "total"}]
+
+
+def test_totals_without_vat_are_not_final_totals():
+    for net in ("Total HT 100,00", "TOTAL NETTO 100,00", "Total excl. VAT 100,00", "Total exkl. MwSt 100,00",
+                "Total ohne MwSt 100,00", "Total imponibil 100,00"):
+        assert row_kind(net) != "total", net
+    for final in ("Total TTC 120,00", "TOTAL DE PLATA 120,00", "Total incl. VAT 120,00"):
+        assert row_kind(final) == "total", final
+
+
+@pytest.mark.parametrize("model_value", [120.0, 100.0])
+def test_several_totals_confirm_nothing(model_value):
+    """Before: OCR confirmed whichever TOTAL row the model read, even the one before the discount,
+    as "high", which made Spendle raise a false "needs a look"."""
+    ev = build_evidence(DISCOUNT, 0)
+    assert [f.value for f in ev.totals] == [120.0, 100.0]
+    fld = field(model_value, "high")
+    note = apply_total_witness(fld, [model_value], ev)
+    assert fld["confidence"] == "low" and "120.00, 100.00" in note
+
+
+def test_payment_tells_which_total_is_final():
+    ev = build_evidence(DISCOUNT + [L("CARD", 230, 1960), L("100,00", 412, 1960)], 0)
+    fld = field(100.0, "high")
+    assert apply_total_witness(fld, [100.0], ev) is None and fld["confidence"] == "high"
+    fld = field(120.0, "high")
+    apply_total_witness(fld, [120.0], ev)
+    assert fld["confidence"] == "low"
+
+
+def test_two_currencies_on_total_rows_are_not_confirmed():
+    ev = build_evidence([L("TOTAL EUR", 230, 500), L("100,00", 600, 500),
+                         L("TOTAL RON", 230, 560), L("497,50", 600, 560)], 0)
+    cur = field("EUR", "high")
+    assert "EUR, RON" in apply_currency_witness(cur, ev) and cur["confidence"] == "low"
+
+
+# ─── When the AI labeler is asked ────────────────────────────────────────────
+
+def test_labeler_only_when_the_rules_are_unsure():
+    assert not needs_labels(build_evidence(ROMPETROL, 0), ROMPETROL)          # one TOTAL row
+    assert needs_labels(build_evidence(DISCOUNT, 0), DISCOUNT)                # two different totals
+    paid = DISCOUNT + [L("CARD", 230, 1960), L("100,00", 412, 1960)]
+    assert not needs_labels(build_evidence(paid, 0), paid)                    # the payment settles it
+    unknown = [L("Gesamtbetrag", 200, 500), L("119,00", 600, 500)]
+    assert needs_labels(build_evidence(unknown, 0), unknown)                  # no keyword it knows
+    no_amounts = [L("ROMPETROL", 300, 100), L("MULTUMIM", 300, 2000)]
+    assert not needs_labels(build_evidence(no_amounts, 0), no_amounts)        # nothing to label
+
+
+def test_prompt_rows_are_numbered_and_long_pages_keep_the_amount_rows():
+    rows, text = prompt_rows(DISCOUNT)
+    assert text.splitlines() == ["[0] Total 120,00", "[1] Reducere 10% -20,00", "[2] Total de plata 100,00"]
+    long_page = [L(f"Produs {i}", 100, 100 + 40 * i) for i in range(200)] + [
+        L("Total de plata", 100, 9000), L("55,00", 600, 9000)]
+    rows, text = prompt_rows(long_page)
+    assert len(rows) == 201 and text.splitlines() == ["[199] Produs 199", "[200] Total de plata 55,00"]
+
+
+# ─── Evidence from the labeler's row kinds ───────────────────────────────────
+
+def test_labels_take_the_digits_from_ocr():
+    ev = evidence_from_labels(group_rows(DISCOUNT), DISCOUNT_LABELS, 0)
+    assert ev.labelled and [f.value for f in ev.totals] == [100.0]
+    assert ev.totals[0].bbox == [412, 1880, 590, 1932]
+
+
+def test_labels_amount_under_its_label_and_payment():
+    lines = [L("Gesamtbetrag", 200, 500, 400, 530), L("119,00 EUR", 200, 540, 400, 570),
+             L("Bar", 200, 620), L("120,00", 600, 620), L("Rückgeld", 200, 660), L("1,00", 600, 660)]
+    labels = [{"row": 0, "kind": "total"}, {"row": 2, "kind": "payment"}, {"row": 3, "kind": "change"}]
+    ev = evidence_from_labels(group_rows(lines), labels, 0)
+    assert [f.value for f in ev.totals] == [119.0] and ev.paid == 119.0
+    assert [c.value for c in ev.currencies] == ["EUR"]
+
+
+def test_unusable_labels_are_ignored():
+    rows = group_rows(DISCOUNT)
+    labels = [{"row": 9, "kind": "total"}, {"row": True, "kind": "total"}, {"row": "2", "kind": "total"},
+              "total", {"row": 0, "kind": "total"}, {"row": 0, "kind": "subtotal"}]   # row 0: two kinds
+    assert evidence_from_labels(rows, labels, 0).totals == []
+
+
+def test_labelled_confirmation_is_medium_not_high():
+    """The AI picked the row, so agreement is not "high"; the digits are still OCR's."""
+    ev = evidence_from_labels(group_rows(DISCOUNT), DISCOUNT_LABELS, 0)
+    fld = field(100.0, "high")
+    assert apply_total_witness(fld, [100.0], ev) == LABELLED_NOTE
+    assert fld["confidence"] == "medium" and fld["bbox"] == [412, 1880, 590, 1932]
+    fld = field(120.0, "high")
+    apply_total_witness(fld, [120.0], ev)
+    assert fld["confidence"] == "low"
+
+
+# ─── End to end: verify_pages with the labeler ───────────────────────────────
+
+def _run_labelled(total, labels=None, fail=(), label_ocr=True, lines=DISCOUNT):
+    from graph.verifier import verify_pages
+    from tests.test_verifier import PRIMARY, _page_b64, amount_lines
+
+    async def ocr(image):
+        return [(l.text, l.bbox) for l in lines]
+
+    backend = FakeBackend(full_page(total=total), full_page(total=total), lines=amount_lines(total),
+                          zoom={"total_amount": total, "currency": "LEI", "receipt_date": "03.11.2026",
+                                "document_number": "F-0042"},
+                          labels={"rows": DISCOUNT_LABELS if labels is None else labels}, fail=fail)
+    resp = asyncio.run(verify_pages([_page_b64()], backend, PRIMARY, None, max_side=1792, ocr=ocr,
+                                    label_ocr=label_ocr)).response
+    return resp, backend
+
+
+def test_discount_invoice_total_before_discount_is_caught():
+    """Every model read takes the amount before the discount; OCR + labeler say 100,00 is final."""
+    resp, backend = _run_labelled("120,00")
+    assert ("qwen3-vl:8b-thinking-q8_0", "labels") in backend.calls
+    assert resp["status"] == "unreadable" and resp["fields"]["total_amount"]["confidence"] == "low"
+    assert "100.00" in resp["notes"]
+
+
+def test_discount_invoice_final_total_is_confirmed():
+    resp, _ = _run_labelled("100,00")
+    total = resp["fields"]["total_amount"]
+    assert resp["status"] == "ok" and total["value"] == 100.0 and total["confidence"] == "medium"
+    assert total["bbox"] == AT_TOTAL and LABELLED_NOTE in resp["notes"]
+
+
+def test_labeler_sees_ocr_text_only_and_vision_reads_never_see_it():
+    _, backend = _run_labelled("100,00")
+    labelled = [i for i, (_, kind) in enumerate(backend.calls) if kind == "labels"]
+    assert len(labelled) == 1 and backend.images[labelled[0]] is None
+    assert "Reducere" in backend.prompts[labelled[0]]
+    for i, (_, kind) in enumerate(backend.calls):
+        if kind != "labels":
+            assert backend.images[i] is not None and "Reducere" not in backend.prompts[i]
+
+
+def test_labeler_not_called_when_the_rules_are_sure():
+    resp, backend = _run_labelled("120,00", lines=[L("TOTAL:", 230, 1880, 360, 1932), L("120,00", 412, 1880, 590, 1932)])
+    assert all(kind != "labels" for _, kind in backend.calls)
+    assert resp["fields"]["total_amount"]["confidence"] == "high"
+
+
+def test_labeler_failure_leaves_the_total_unconfirmed():
+    from tests.test_verifier import PRIMARY
+    resp, _ = _run_labelled("100,00", fail={(PRIMARY, "labels")})
+    assert resp["status"] == "unreadable" and "OCR labeler failed" in resp["notes"]
+
+
+def test_without_labeler_several_totals_are_unreadable():
+    resp, backend = _run_labelled("100,00", label_ocr=False)
+    assert all(kind != "labels" for _, kind in backend.calls)
+    assert resp["status"] == "unreadable" and "nothing tells which one is final" in resp["notes"]
+
+
+def test_unknown_language_confirmed_through_the_labeler():
+    lines = [L("Gesamtbetrag", 230, 1880, 400, 1932), L("120,00", 412, 1880, 590, 1932)]
+    resp, _ = _run_labelled("120,00", lines=lines, labels=[{"row": 0, "kind": "total"}])
+    total = resp["fields"]["total_amount"]
+    assert resp["status"] == "ok" and total["confidence"] == "medium" and total["bbox"] == AT_TOTAL

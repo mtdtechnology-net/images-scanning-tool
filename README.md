@@ -150,6 +150,7 @@ An unsupported or corrupt file is a client error: HTTP 400 like the other endpoi
 | B | `VERIFY_MODEL` | the total's page at 0.75× that size, other prompt | every amount line with its label (subtotal, VAT, total, cash, change); code picks the final total |
 | C | `VERIFY_MODEL` | a full-width strip around the total, currency and date A located, enlarged up to 2× | that one value again, at a higher resolution (not done for the document number, which is informative only) |
 | D | `VERIFY_SECOND_MODEL` (another Qwen generation) | the pages where A found fields | the same as A |
+| Labeler | `VERIFY_MODEL`, **text only** | the OCR rows of the total's page, only when the OCR rules are unsure (below) | a kind for each row with an amount; code takes the digits from the OCR text |
 
 Confidence is measured from agreement, never self-reported:
 
@@ -161,15 +162,32 @@ Confidence is measured from agreement, never self-reported:
 
 **OCR witness (total and currency).** `VERIFY_OCR_WITNESS=true` (default). PaddleOCR reads the
 total's page once, as it is (no crop, so its boxes are page pixels), on the instance the live scans
-use (~1–2 s on GPU). The model never sees this text. Plain code finds the **TOTAL row** (not
-SUBTOTAL / TOTAL TVA / TAXE; `TVA` OCR'd as `TUA` included), the **payment rows** (CARD, NUMERAR,
+use (~1–2 s on GPU). The vision reads never see this text. Plain code finds the **TOTAL row** (not
+SUBTOTAL / TOTAL TVA / TAXE, nor a total without VAT: HT, NETTO, EXCL, EXKL, OHNE, IMPONIBIL; `TVA`
+OCR'd as `TUA` included), the **payment rows** (CARD, NUMERAR,
 CASH, CARTE CREDIT) minus **REST**, and the **currency on the TOTAL row** ("TOTAL LEI"). The amount
 may sit on the label's row or, as on invoices, on the row right below it ("Total de plata" /
 "1239.25 RON"; a second row below, usually a conversion, is ignored). Only amounts with two
 decimals count, so card numbers and codes never match.
 
-When these label rules find nothing (an unknown layout or language: "Gesamtbetrag", "Amount due",
-a total in a table column), a **location witness** takes over: OCR reads the text inside the box
+**Several totals or an unknown layout: the AI labeler.** `VERIFY_OCR_LABELER=true` (default). The
+label rules can't always name the final total:
+- several TOTAL rows with different amounts (before and after a discount, net and gross, a total and
+  its conversion) and no payment row that matches one of them;
+- no TOTAL keyword they know ("Gesamtbetrag", "Amount due", "Totale").
+
+Then `VERIFY_MODEL` gets the OCR rows of that page **as text only**: no image, none of the model's
+reads, no declared values. It labels each row with an amount (`total`, `net_total`, `subtotal`,
+`discount`, `vat`, `payment`, `change`, `converted`, `other`) and returns row numbers, never amounts:
+code takes the digits from the OCR text, so the labeler can't invent or "correct" them. An AI chose
+the row, so a total confirmed this way is at most `medium`. It is one extra call, only on those
+documents, made while the primary model is still loaded (no extra swap).
+
+Without the labeler (off, or it failed), several different totals that no payment settles confirm
+nothing: the total becomes `low` → `unreadable`. Before, OCR confirmed whichever of them the model
+read, so a total read before the discount came back `high` and Spendle raised a false "needs a look".
+
+When neither the label rules nor the labeler find a total, a **location witness** takes over: OCR reads the text inside the box
 where the model located the total. It needs no keywords, so it works on any layout. It proves the
 digits, not that the model picked the right line (it would confirm a subtotal too), so it never
 raises the confidence; it only counts as the total's independent confirmation.
@@ -177,6 +195,8 @@ raises the confidence; it only counts as the total's independent confirmation.
 | Model total vs OCR | Result |
 |---|---|
 | OCR reads the same amount on the TOTAL row | `high`, with OCR's exact box. A payment line that disagrees only lowers it to `medium` with a note (payment lines get misread too). |
+| OCR reads several different amounts on TOTAL rows | a payment line equal to one of them picks it; otherwise the labeler decides; without a labeler result, `low` → `unreadable` |
+| The labeler picked the final-total row and OCR reads the same amount there | `medium` (not `high`: an AI chose the row), with OCR's exact box |
 | A minority model read equals OCR's TOTAL row **and** the payment | that value, `medium`, with a note |
 | OCR reads a different amount on the TOTAL row | `low` → status `unreadable` |
 | OCR has no TOTAL row, payment matches / differs | payment decides: `medium` / `low` |
@@ -185,8 +205,9 @@ raises the confidence; it only counts as the total's independent confirmation.
 | OCR finds neither TOTAL nor payment (faded receipt) | fallback: the model's own read of the payment lines (read B); a different *payment − change* makes the total `low` |
 | Nothing independent confirms the total (read B failed, OCR found nothing at the TOTAL row, the payment or the model's box, no matching payment) | `low` → `unreadable`: reads A and C look at the same spot, so they count as one |
 
-Currency: confirmed by the currency on the TOTAL row → `high` with its box; the model found none but
-the TOTAL row prints one → filled in, `medium`; different currencies → `low`. A currency found
+Currency: confirmed by the currency on the TOTAL row → `high` with its box (`medium` when the labeler
+picked the row); the model found none but the TOTAL row prints one → filled in, `medium`; different
+currencies → `low`; two currencies on the total rows (a total and its conversion) → `low`. A currency found
 anywhere else on the page is ignored. On the 10 benchmark receipts, real PaddleOCR found the right
 TOTAL and payment on 9 (the 10th is the faded one) and "LEI" on every Rompetrol receipt.
 
@@ -255,6 +276,7 @@ Check the exact tags in the Ollama library before pulling. Qwen VL models above 
 | `VERIFY_WAIT_IDLE_TIMEOUT` | `60` | Seconds to wait for live scans to end before answering `error`. |
 | `VERIFY_IDLE_GRACE_S` | `10` | Quiet seconds after the last scan before a verification starts. |
 | `VERIFY_OCR_WITNESS` | `true` | Run PaddleOCR once on the total's page as an independent witness for the total and the currency (exact boxes). |
+| `VERIFY_OCR_LABELER` | `true` | When the OCR rules can't tell which row is the final total, `VERIFY_MODEL` labels the OCR rows from the text (one extra call, only on those documents). |
 
 ### VRAM budget (16 GB RTX 5060 Ti)
 

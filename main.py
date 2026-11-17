@@ -17,7 +17,8 @@ from ollama import AsyncClient
 from core.config import (
     CORS_ORIGINS, LLM_CONCURRENCY, LLM_IMAGE_MAX_SIDE, MAX_FILE_SIZE, MAX_PAGES,
     OLLAMA_BASE_URL, OLLAMA_KEEP_ALIVE, OLLAMA_MODEL, OLLAMA_NUM_CTX,
-    VERIFY_IDLE_GRACE_S, VERIFY_MODEL, VERIFY_OCR_WITNESS, VERIFY_PDF_SCALE, VERIFY_SECOND_MODEL,
+    VERIFY_IDLE_GRACE_S, VERIFY_MODEL, VERIFY_OCR_LABELER, VERIFY_OCR_WITNESS, VERIFY_PDF_SCALE,
+    VERIFY_SECOND_MODEL,
     VERIFY_TOTAL_TIMEOUT, VERIFY_WAIT_IDLE_TIMEOUT,
 )
 from core.gpu_gate import GpuBusy, Preempted, live_scans, verify_semaphore
@@ -368,7 +369,8 @@ def _verify_error(notes: str, pages: list[dict] | None = None, duration_ms: int 
 async def _run_verification(backend: OllamaBackend, images: list[str]):
     await backend.begin()
     return await verify_pages(images, backend, VERIFY_MODEL, VERIFY_SECOND_MODEL or None,
-                              ocr=ocr_page_lines if VERIFY_OCR_WITNESS else None)
+                              ocr=ocr_page_lines if VERIFY_OCR_WITNESS else None,
+                              label_ocr=VERIFY_OCR_LABELER)
 
 
 @app.post("/api/verify-receipt")

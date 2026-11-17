@@ -114,3 +114,50 @@ ZOOM_TARGETS = {
 ZOOM_PROMPT = """This image is a zoomed-in strip of a receipt or invoice.
 Copy exactly the characters of {target}, as printed (keep separators such as "1.234,56").
 Do not guess: if it is not fully visible or not readable in this strip, return "text": ""."""
+
+# OCR row labeler (primary model, text only). Runs only when the plain OCR rules can't tell which
+# row holds the final total (several TOTAL rows with different amounts, or no keyword they know).
+# It sees the OCR rows of one page, never the image, the model's reads or the declared values.
+# It returns row numbers and kinds only, never amounts: code takes the digits from the OCR text.
+ROW_KINDS = ["total", "net_total", "subtotal", "discount", "vat", "payment", "change", "converted", "other"]
+
+OCR_ROWS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rows": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "row": {"type": "integer"},
+                    "kind": {"type": "string", "enum": ROW_KINDS},
+                },
+                "required": ["row", "kind"],
+            },
+        },
+    },
+    "required": ["rows"],
+}
+
+OCR_ROWS_PROMPT = """Below are the text rows an OCR engine read on one page of a receipt or invoice, top to
+bottom, each with its number in brackets. The document can be in any language and any layout.
+
+Classify every row that contains a money amount. Judge each row by its own label and, when an amount
+is printed under its label, by the label on the row above. Kinds:
+- "total": the final amount to pay for the whole document, VAT included, after discounts
+  (e.g. TOTAL, TOTAL DE PLATĂ, Total TTC, Gesamtbetrag, Totale, Amount due, Grand total);
+- "net_total": a total without VAT (e.g. Total HT, fără TVA, netto, excl. VAT, imponibil);
+- "subtotal": a subtotal, before discounts, VAT or other charges;
+- "discount": a discount or reduction;
+- "vat": a VAT or tax amount;
+- "payment": what the customer paid with or handed over (card, cash, NUMERAR, BAR, voucher);
+- "change": change given back to the customer (REST, Rückgeld, change);
+- "converted": an amount converted into another currency (next to an exchange rate or an
+  "equivalent"), when the same total is also printed in the document's own currency;
+- "other": product lines, unit prices, quantities, VAT bases in a VAT table, anything else.
+
+Return {{"rows": [{{"row": <number>, "kind": <kind>}}, ...]}} for the rows with an amount. Do not copy
+or calculate amounts.
+
+Rows:
+{rows}"""
