@@ -8,6 +8,10 @@ declared. Confidence comes from agreement between independent reads, not from th
   C  primary model, zoomed strip around each field A located
   D  second model (other Qwen generation), full page + boxes   (pages where A found fields)
 
+OCR (PaddleOCR) is a separate witness for the total and the currency (graph/ocr_witness.py). When
+its plain rules can't tell which row is the final total, the primary model labels the OCR rows as
+text (no image, no reads, no declared values); the digits still come from OCR.
+
   high    every read that ran agrees after normalization, and two reads put a box on the same spot
   medium  reads agree but there is no reliable box, a read did not find the value,
           or they differ only in formatting (document number "F-0042" vs "F42")
@@ -30,12 +34,13 @@ from PIL import Image
 from core.config import VERIFY_IMAGE_MAX_SIDE, VERIFY_QWEN25_MAX_PIXELS, VERIFY_READ_RETRIES
 from graph.normalize import FIELDS, NORMALIZERS, loose_key, normalize_amount
 from graph.ocr_witness import (
-    OcrLine, apply_currency_witness, apply_location_witness, apply_total_witness, build_evidence,
+    OcrEvidence, OcrLine, apply_currency_witness, apply_location_witness, apply_total_witness,
+    build_evidence, evidence_from_labels, needs_labels, prompt_rows,
 )
 from graph.verifier_ollama import VerifierError
 from prompts.verify import (
     AMOUNT_LINES_PROMPT, AMOUNT_LINES_SCHEMA, FULL_PAGE_PROMPT, FULL_PAGE_SCHEMA,
-    ZOOM_PROMPT, ZOOM_SCHEMA, ZOOM_TARGETS,
+    OCR_ROWS_PROMPT, OCR_ROWS_SCHEMA, ZOOM_PROMPT, ZOOM_SCHEMA, ZOOM_TARGETS,
 )
 from tools.parser import image_to_base64
 
@@ -50,7 +55,7 @@ BBOX_PRIORITY = ("D", "A", "B")                    # Qwen2.5-VL boxes are the mo
 class Backend(Protocol):
     async def load(self, model: str) -> None: ...
     async def unload(self, model: str) -> None: ...
-    async def chat(self, model: str, prompt: str, image_b64: str, schema: dict) -> str: ...
+    async def chat(self, model: str, prompt: str, image_b64: Optional[str], schema: dict) -> str: ...
 
 
 # ─── Images and boxes ────────────────────────────────────────────────────────
@@ -196,13 +201,14 @@ def pick_total_line(lines: list) -> Optional[dict]:
 
 # ─── Reads ───────────────────────────────────────────────────────────────────
 
-async def _ask(backend: Backend, model: str, prompt: str, img: ModelImage, schema: dict) -> dict:
-    """One read; retried when the model returns nothing usable (a thinking model that ran
-    out of tokens, broken JSON). Transport errors are not retried: they come from Ollama."""
+async def _ask(backend: Backend, model: str, prompt: str, img: Optional[ModelImage], schema: dict) -> dict:
+    """One read (text only when `img` is None); retried when the model returns nothing usable
+    (a thinking model that ran out of tokens, broken JSON). Transport errors are not retried:
+    they come from Ollama."""
     error: Optional[VerifierError] = None
     for attempt in range(1 + max(0, VERIFY_READ_RETRIES)):
         try:
-            data = parse_json(await backend.chat(model, prompt, img.b64, schema))
+            data = parse_json(await backend.chat(model, prompt, img.b64 if img else None, schema))
         except VerifierError as e:
             if "tokens" not in str(e):  # only the token-limit error is worth retrying
                 raise
@@ -274,6 +280,15 @@ async def read_zoom(backend: Backend, model: str, fld: str, image: Image.Image, 
     img = ModelImage(image_to_base64(strip, quality=JPEG_QUALITY), *strip.size)
     data = await _ask(backend, model, ZOOM_PROMPT.format(target=ZOOM_TARGETS[fld]), img, ZOOM_SCHEMA)
     return make_reading("C", fld, data.get("text"), page)
+
+
+async def label_ocr_rows(backend: Backend, model: str, lines: list[OcrLine], page: int) -> OcrEvidence:
+    """The model labels the OCR rows of one page by meaning (final total, net total, discount,
+    payment...), from the text only. It returns row numbers, never amounts: the evidence takes
+    the digits from the OCR text."""
+    rows, text = prompt_rows(lines)
+    data = await _ask(backend, model, OCR_ROWS_PROMPT.format(rows=text), None, OCR_ROWS_SCHEMA)
+    return evidence_from_labels(rows, data.get("rows") if isinstance(data.get("rows"), list) else [], page)
 
 
 # ─── Combining reads ─────────────────────────────────────────────────────────
@@ -386,9 +401,11 @@ OcrFn = Callable[[Image.Image], Awaitable[list[tuple[str, list[int]]]]]
 
 async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
                        second: Optional[str] = None, max_side: int = VERIFY_IMAGE_MAX_SIDE,
-                       ocr: Optional[OcrFn] = None) -> Outcome:
+                       ocr: Optional[OcrFn] = None, label_ocr: bool = False) -> Outcome:
     """Run every read on the page images and build the API response (without duration_ms).
-    `ocr(page_image)` (optional) returns (text, box) lines: the independent OCR witness."""
+    `ocr(page_image)` (optional) returns (text, box) lines: the independent OCR witness.
+    `label_ocr`: when the OCR rules can't tell which row is the final total, the primary model
+    labels the OCR rows (text only)."""
     pages = [decode_page(b64) for b64 in images_b64]
     notes: list[str] = []
     paid: Optional[float] = None
@@ -421,6 +438,33 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
             except VerifierError as e:
                 notes.append(f"read C on {fld} failed ({e})")
 
+    # ── OCR witness: read the total's page now, while the primary model is still loaded for the
+    # labeler. The vision reads above never saw this text; read D below doesn't either. ──
+    ocr_lines: Optional[list[OcrLine]] = None
+    ev: Optional[OcrEvidence] = None
+    ocr_log = "off"
+    if ocr is not None and doc_pages:
+        page = field_page["total_amount"]
+        try:
+            ocr_lines = [OcrLine(text, box) for text, box in await ocr(pages[page])]
+            ev = build_evidence(ocr_lines, page)
+            ocr_log = (f"{len(ocr_lines)} lines, TOTAL rows={[f.value for f in ev.totals]}, paid={ev.paid}, "
+                       f"currencies={[f.value for f in ev.currencies]}")
+            if label_ocr and needs_labels(ev, ocr_lines):
+                try:
+                    labelled = await label_ocr_rows(backend, primary, ocr_lines, page)
+                    ocr_log += (f"; labeler: total rows={[f.value for f in labelled.totals]}, "
+                                f"paid={labelled.paid}, currencies={[f.value for f in labelled.currencies]}")
+                    if labelled.has_amounts:
+                        ev = labelled
+                except VerifierError as e:
+                    notes.append(f"OCR labeler failed ({e})")
+                    ocr_log += "; labeler failed"
+        except Exception as e:  # noqa: BLE001 - OCR trouble must not lose the model's reads
+            logger.warning("OCR witness failed: %s", e)
+            notes.append("OCR witness unavailable")
+            ocr_lines, ev, ocr_log = None, None, "failed"
+
     # ── Second model: D ──
     d_reads: dict[int, PageRead] = {}
     if second:
@@ -446,14 +490,9 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
     total = fields["total_amount"]
     witnessed = False   # the label rules (TOTAL row, payment) judged the total
     located = False     # OCR read the total where the model located it (any layout)
-    ocr_log = "off"
-    if ocr is not None and doc_pages:
-        page = field_page["total_amount"]
+    if ev is not None and ocr_lines is not None:
+        page = ev.page
         try:
-            lines = [OcrLine(text, box) for text, box in await ocr(pages[page])]
-            ev = build_evidence(lines, page)
-            ocr_log = (f"{len(lines)} lines, TOTAL rows={[f.value for f in ev.totals]}, paid={ev.paid}, "
-                       f"currencies={[f.value for f in ev.currencies]}")
             read_values = [r.value for r in readings["total_amount"] if r.value is not None]
             if ev.has_amounts:
                 note = apply_total_witness(total, read_values, ev)
@@ -464,13 +503,13 @@ async def verify_pages(images_b64: list[str], backend: Backend, primary: str,
                 boxes = [r.bbox for r in readings["total_amount"]
                          if r.bbox and r.page == page and r.value is not None
                          and abs(r.value - total["value"]) < 0.005]
-                located, note = apply_location_witness(total, boxes, lines, page)
+                located, note = apply_location_witness(total, boxes, ocr_lines, page)
                 if note:
                     notes.append(note)
             note = apply_currency_witness(fields["currency"], ev)
             if note:
                 notes.append(note)
-        except Exception as e:  # noqa: BLE001 - OCR trouble must not lose the model's reads
+        except Exception as e:  # noqa: BLE001 - a bug here must not lose the model's reads
             logger.warning("OCR witness failed: %s", e)
             notes.append("OCR witness unavailable")
             ocr_log = "failed"

@@ -67,3 +67,13 @@ def test_running_out_of_tokens_is_reported_clearly():
     backend._thinking = {"qwen3-vl:8b": True}
     with pytest.raises(VerifierError, match="tokens .*while thinking"):
         asyncio.run(backend.chat("qwen3-vl:8b", "p", "img", {}))
+
+
+def test_text_only_call_sends_no_image():
+    backend = OllamaBackend()
+    backend.client = ChatClient()
+    backend._thinking = {"qwen3-vl:8b": True}
+    asyncio.run(backend.chat("qwen3-vl:8b", "rows", None, {}))
+    assert "images" not in backend.client.kwargs["messages"][0]
+    asyncio.run(backend.chat("qwen3-vl:8b", "p", "img", {}))
+    assert backend.client.kwargs["messages"][0]["images"] == ["img"]

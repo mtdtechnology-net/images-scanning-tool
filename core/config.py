@@ -66,6 +66,9 @@ VERIFY_IDLE_GRACE_S = float(os.getenv("VERIFY_IDLE_GRACE_S", "10"))
 # OCR as an independent witness for the total and the currency (the model never sees OCR text).
 # Runs once on the total's page, on the same PaddleOCR instance as live scans (~1-2 s on GPU).
 VERIFY_OCR_WITNESS = os.getenv("VERIFY_OCR_WITNESS", "true").strip().lower() in ("1", "true", "yes")
+# When the OCR rules can't tell which row is the final total (several TOTAL rows with different
+# amounts, or no keyword they know), VERIFY_MODEL labels the OCR rows from the text (one extra call).
+VERIFY_OCR_LABELER = os.getenv("VERIFY_OCR_LABELER", "true").strip().lower() in ("1", "true", "yes")
 
 # ─── OCR ─────────────────────────────────────────────────────────────────────
 OCR_DEVICE = os.getenv("OCR_DEVICE", "cpu")  # "gpu" on the server

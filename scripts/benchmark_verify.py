@@ -54,7 +54,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import httpx  # noqa: E402
 
 from core.config import (  # noqa: E402
-    OCR_DEVICE, OCR_LANG, OLLAMA_BASE_URL, VERIFY_IMAGE_MAX_SIDE, VERIFY_PDF_SCALE, VERIFY_TOTAL_TIMEOUT,
+    OCR_DEVICE, OCR_LANG, OLLAMA_BASE_URL, VERIFY_IMAGE_MAX_SIDE, VERIFY_OCR_LABELER, VERIFY_PDF_SCALE,
+    VERIFY_TOTAL_TIMEOUT,
 )
 from graph.normalize import (  # noqa: E402
     FIELDS, _NUMBER_RE, document_number_key, normalize_amount, normalize_currency, normalize_date,
@@ -284,7 +285,8 @@ async def run_verifier_config(config: str, receipts: list[Receipt], sampler: Opt
         try:
             await backend.begin()
             outcome = await asyncio.wait_for(
-                verify_pages(rec.pages, backend, primary, second or None, max_side, ocr=ocr), VERIFY_TOTAL_TIMEOUT)
+                verify_pages(rec.pages, backend, primary, second or None, max_side, ocr=ocr,
+                             label_ocr=ocr is not None and VERIFY_OCR_LABELER), VERIFY_TOTAL_TIMEOUT)
             body, status = outcome.response, outcome.response["status"]
         except (VerifierError, asyncio.TimeoutError) as e:
             err = str(e) or type(e).__name__
