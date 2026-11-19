@@ -18,8 +18,10 @@ class BusinessTripExpense(BaseModel):
 class LLMExtraction(BaseModel):
     """Exact shape the LLM must return. Its JSON schema is passed to Ollama as
     `format`, so decoding is constrained to valid JSON with every field present.
-    `valid` comes first so the model decides it before filling the fields."""
+    `valid` comes first so the model decides it before filling the fields.
+    `reject_reason` is only logged (why a document was rejected), never sent to the client."""
     valid: bool
+    reject_reason: str
     expense_description: str
     invoice_number_date: str
     receipt_date: str
