@@ -171,10 +171,11 @@ async def run_extraction_hybrid(text: str, image_b64: str, doc_index: int) -> li
         return []
 
     if not data.valid:
-        logger.info("LLM page %d rejected: not a fiscal receipt", doc_index + 1)
+        logger.info("LLM page %d rejected: not a fiscal receipt (reason: %s)",
+                    doc_index + 1, (data.reject_reason or "none given").strip()[:300])
         return INVALID_DOC_ERROR
 
-    exp = BusinessTripExpense(**data.model_dump(exclude={"valid"}))
+    exp = BusinessTripExpense(**data.model_dump(exclude={"valid", "reject_reason"}))
     exp.expense_category = _normalize_category(exp.expense_category)
 
     # ── Guardrail 1: validate receipt_date against OCR text ──

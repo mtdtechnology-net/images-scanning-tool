@@ -7,10 +7,12 @@ Your task: Determine if this document is a fiscal receipt or invoice. If it IS, 
 CRITICAL INSTRUCTIONS:
 
 1. FIRST, decide if this is a fiscal receipt/invoice. If the document is something else (e.g., ID card, medical certificate, diploma, contract, personal document), return:
-   {{"valid": false}} (fill the remaining fields with "" or 0)
+   {{"valid": false, "reject_reason": "..."}} (fill the remaining fields with "" or 0)
+   reject_reason: one short English sentence saying what the document is and why it is not a
+   fiscal receipt or invoice. Do not copy names, numbers or amounts from the document.
 
 2. If it IS a valid receipt/invoice, extract EXACTLY ONE expense and return:
-   {{"valid": true, "expense_description": "...", "invoice_number_date": "...", "receipt_date": "...", "expense_amount": ..., "currency": "...", "expense_category": "...", "vendor_city": "...", "vendor_country": "...", "number_of_nights": ..., "check_in_date": "...", "check_out_date": "..."}}
+   {{"valid": true, "reject_reason": "", "expense_description": "...", "invoice_number_date": "...", "receipt_date": "...", "expense_amount": ..., "currency": "...", "expense_category": "...", "vendor_city": "...", "vendor_country": "...", "number_of_nights": ..., "check_in_date": "...", "check_out_date": "..."}}
 
 3. Extracted Fields (only when valid is true):
    - expense_description: A short description based on the vendor or main item.
